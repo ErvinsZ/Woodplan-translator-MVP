@@ -1,69 +1,207 @@
-import Image from "next/image";
+"use client";
+
+import { upload } from "@vercel/blob/client";
+import { useCallback, useRef, useState } from "react";
+
+type Status = "idle" | "uploading" | "translating" | "done" | "error";
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export default function Home() {
+  const [file, setFile] = useState<File | null>(null);
+  const [status, setStatus] = useState<Status>("idle");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [downloadName, setDownloadName] = useState("");
+  const [dragActive, setDragActive] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const reset = useCallback(() => {
+    setFile(null);
+    setStatus("idle");
+    setErrorMessage("");
+    setDownloadUrl(null);
+    setDownloadName("");
+  }, []);
+
+  const pickFile = useCallback((picked: File | null) => {
+    if (!picked) return;
+    if (picked.type !== "application/pdf") {
+      setStatus("error");
+      setErrorMessage("Only PDF files are supported right now.");
+      return;
+    }
+    setFile(picked);
+    setStatus("idle");
+    setErrorMessage("");
+    setDownloadUrl(null);
+  }, []);
+
+  const translate = useCallback(async () => {
+    if (!file) return;
+    setErrorMessage("");
+    try {
+      // Uploads straight to Blob storage from the browser, bypassing
+      // every Vercel Function's 4.5MB request-body cap.
+      setStatus("uploading");
+      const uploaded = await upload(file.name, file, {
+        access: "public",
+        handleUploadUrl: "/api/upload-token",
+      });
+
+      setStatus("translating");
+      const res = await fetch("/api/translate?lang=de", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ blob_url: uploaded.url, filename: file.name }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error ?? "Translation failed. Please try again.");
+      }
+      setDownloadUrl(data.download_url);
+      setDownloadName(data.filename);
+      setStatus("done");
+    } catch (err) {
+      setStatus("error");
+      setErrorMessage(
+        err instanceof Error ? err.message : "Translation failed. Please try again."
+      );
+    }
+  }, [file]);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
+    <div className="flex flex-1 items-center justify-center px-6 py-16">
+      <div className="w-full max-w-xl border border-line-strong bg-paper shadow-[6px_6px_0_var(--color-line)]">
+        {/* title block, styled after the plan's own corner stamp */}
+        <div className="flex items-center justify-between border-b border-line-strong px-5 py-3 font-mono text-[11px] uppercase tracking-[0.14em] text-muted">
+          <span>Woodplan Translator</span>
+          <span className="text-accent">EN &rarr; DE</span>
+        </div>
+
+        <div className="px-6 py-8 sm:px-9 sm:py-10">
+          <h1 className="font-display text-[28px] font-medium leading-tight text-foreground sm:text-[32px]">
+            Translate a build plan
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+          <p className="mt-3 max-w-md text-[15px] leading-6 text-muted">
+            Upload a PDF. Dimensions, part codes, and cutout lists stay
+            exactly where they are on the page &mdash; only the words move.
           </p>
+
+          <div className="mt-8">
+            {!file && (
+              <label
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragActive(true);
+                }}
+                onDragLeave={() => setDragActive(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDragActive(false);
+                  pickFile(e.dataTransfer.files?.[0] ?? null);
+                }}
+                className={`flex cursor-pointer flex-col items-center gap-2 border-2 border-dashed px-6 py-12 text-center transition-colors ${
+                  dragActive
+                    ? "border-accent bg-accent/5"
+                    : "border-line-strong hover:border-blueprint"
+                }`}
+              >
+                <span className="font-mono text-xs uppercase tracking-[0.1em] text-muted">
+                  Drop PDF here, or
+                </span>
+                <span className="font-mono text-sm font-medium text-blueprint underline underline-offset-4">
+                  browse files
+                </span>
+                <input
+                  ref={inputRef}
+                  type="file"
+                  accept="application/pdf"
+                  className="sr-only"
+                  onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+                />
+              </label>
+            )}
+
+            {file && (
+              <div className="border border-line-strong px-5 py-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-sm text-foreground">
+                      {file.name}
+                    </p>
+                    <p className="mt-0.5 font-mono text-xs text-muted">
+                      {formatBytes(file.size)}
+                    </p>
+                  </div>
+                  {status !== "uploading" && status !== "translating" && (
+                    <button
+                      type="button"
+                      onClick={reset}
+                      className="shrink-0 font-mono text-xs uppercase tracking-[0.1em] text-muted underline underline-offset-4 hover:text-foreground"
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+
+                {status !== "done" && (
+                  <button
+                    type="button"
+                    onClick={translate}
+                    disabled={status === "uploading" || status === "translating"}
+                    className="mt-4 w-full bg-accent px-4 py-3 font-mono text-sm font-medium uppercase tracking-[0.08em] text-accent-foreground transition-opacity disabled:opacity-60"
+                  >
+                    {status === "uploading"
+                      ? "Uploading…"
+                      : status === "translating"
+                        ? "Translating…"
+                        : "Translate to German"}
+                  </button>
+                )}
+
+                {(status === "uploading" || status === "translating") && (
+                  <div className="mt-3 h-[2px] w-full overflow-hidden bg-line">
+                    <div className="h-full w-1/3 animate-[scan_1.1s_ease-in-out_infinite] bg-blueprint" />
+                  </div>
+                )}
+
+                {status === "done" && downloadUrl && (
+                  <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+                    <a
+                      href={downloadUrl}
+                      download={downloadName}
+                      className="flex-1 bg-blueprint px-4 py-3 text-center font-mono text-sm font-medium uppercase tracking-[0.08em] text-paper"
+                    >
+                      Download translated PDF
+                    </a>
+                    <button
+                      type="button"
+                      onClick={reset}
+                      className="px-4 py-3 font-mono text-xs uppercase tracking-[0.1em] text-muted underline underline-offset-4 hover:text-foreground"
+                    >
+                      Translate another
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {status === "error" && (
+              <p className="mt-4 border-l-2 border-accent pl-3 text-sm leading-6 text-foreground">
+                {errorMessage}
+              </p>
+            )}
+          </div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        <div className="border-t border-line-strong px-5 py-2.5 font-mono text-[10px] uppercase tracking-[0.14em] text-muted">
+          German only &middot; glossary-based &middot; unmatched text flagged, not guessed
         </div>
-      </main>
+      </div>
     </div>
   );
 }

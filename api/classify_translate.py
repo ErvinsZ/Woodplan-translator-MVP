@@ -25,8 +25,16 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
 """
 
 import json
+import os
 import re
+import sys
 from http.server import BaseHTTPRequestHandler
+
+# Vercel's Python runtime loads the entrypoint via importlib (exec_module),
+# not as a directly-run script, so this file's own directory is never
+# auto-added to sys.path the way `python classify_translate.py` would --
+# sibling imports silently 404 with ModuleNotFoundError without this.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from glossary import GLOSSARY
 
