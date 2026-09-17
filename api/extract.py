@@ -114,7 +114,10 @@ def extract_page(page, page_index):
 
 def extract_document(pdf_stream_or_path, document_name=None):
     """Extract all pages of a PDF into the JSON schema."""
-    doc = pymupdf.open(pdf_stream_or_path)
+    if isinstance(pdf_stream_or_path, (bytes, bytearray)):
+        doc = pymupdf.open(stream=pdf_stream_or_path, filetype="pdf")
+    else:
+        doc = pymupdf.open(pdf_stream_or_path)
     try:
         pages = [extract_page(doc[i], i) for i in range(doc.page_count)]
     finally:
