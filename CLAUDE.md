@@ -259,3 +259,32 @@ pixels**. This means:
 
 ### Package manager
 - This project uses **npm**, not pnpm. Use npm commands throughout.
+
+---
+
+## Design Guidelines
+
+Avoid generic "AI-generated" website patterns. Be deliberate and specific to this product, not templated.
+
+### Don't default to:
+- Centered hero with gradient blob background + oversized bold headline + two pill buttons
+- Purple-to-blue or blue-to-teal gradients (the AI-website cliché)
+- Symmetric 3-column feature grids with icon-title-description repeated identically
+- Glassmorphism/frosted-blur cards as the go-to "modern" look
+- Inter/system-ui with no real type scale or hierarchy
+- Generic outline icon sets (checkmarks in circles, lightning bolts, rockets) as filler
+- Cartoon stock-illustration people at laptops
+- "Fade up on scroll" applied uniformly to every element, or hover-scale on every card
+- SaaS filler copy: "Supercharge your workflow," "Unlock your potential," "Everything you need in one place"
+
+### Instead:
+- Pick one strong, specific visual idea (an unusual color, a layout quirk, a distinct type pairing) rather than stacking trendy effects
+- Choose colors, type, and layout based on what this product/brand actually is
+- Vary section rhythm and spacing — not every section needs identical padding/centering
+- Copy should be concrete and specific to the product, not generic benefit-speak
+- Minimal, asymmetric, dense, or unconventional layouts are fine if they fit the content
+
+### Next.js specifics:
+- Don't reach for shadcn/ui defaults unstyled — theme them intentionally (colors, radii, spacing) rather than shipping default Tailwind/shadcn look
+- Avoid the default `next/font` Inter/Geist setup without considering a more distinctive pairing
+- Check `tailwind.config` for an existing design system/tokens before inventing new ad hoc colors per component
