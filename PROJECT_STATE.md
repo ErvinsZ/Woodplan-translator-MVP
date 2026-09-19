@@ -123,7 +123,10 @@ translators that don't understand dimensioned technical drawings.
   (project-level file — global npm config does NOT have this set, don't
   rely on it).
 - **Python deps**: `requirements.txt` at repo root, pinned exact versions
-  (`pymupdf==1.28.2`, `certifi==2026.7.22`). No venv checked in; Vercel's
+  (`pymupdf==1.28.2`, `certifi==2026.7.22`, `pg8000==1.31.5`). No compiled/
+  native-extension packages (see §6's note on why — `psycopg`/
+  `google-genai` both broke real `vercel dev` despite working in a local
+  venv). No venv checked in; Vercel's
   `uv`-based builder provisions one per function at build time.
 - **Design system**: warm "drafting paper" palette (see globals.css tokens),
   Space Grotesk (display) + IBM Plex Mono (labels/mono), explicitly avoiding
@@ -227,8 +230,134 @@ translators that don't understand dimensioned technical drawings.
 
 ## 6. What's in progress
 
-Nothing mid-edit. `dev` is in a clean, fully-committed, working state as of
-the last session. The natural next slice (per CLAUDE.md's suggested branch
+**Dynamic Gemini-backed translation + Spanish/French support** — built and
+verified this session, committed to `feature/dynamic-translation` (not
+merged/pushed yet). Plan lives at
+`~/.claude/plans/wiggly-imagining-stream.md`. Adds a 4th classify/translate
+tier: spans the static glossary misses now check a Postgres-backed dynamic
+cache (`glossary_terms` table) first, then fall back to a Gemini API call
+with full-sentence context (to resolve homographs like "board" the lumber
+vs. "board" a ship — a naive per-word fallback would get these wrong).
+Successful Gemini translations are saved back to the cache, so repeat
+occurrences (within a document or across future documents/sellers) hit the
+cache instead of calling the API again.
+
+- **New Postgres database provisioned**: Neon, created directly at
+  neon.tech (NOT via `vercel integration add neon`) — deliberately, because
+  Vercel's marketplace-managed billing wrapper reportedly has no hard spend
+  cap once free-tier usage is exceeded, whereas Neon's own direct free tier
+  is hard-capped (100 CU-hours/month, 0.5GB) with no card on file. `DATABASE_URL`
+  (pooled, hostname has `-pooler`) and `DIRECT_URL` (direct) are real now,
+  in both `.env.local` and all three Vercel project environments — no
+  longer placeholders. Note: Neon's pooling is hostname-based
+  (`-pooler` suffix), not port-based like Supabase's 6543/5432 split this
+  file previously described — same pooled-for-runtime/direct-for-migrations
+  concept, different URL shape.
+- **New Prisma model**: `GlossaryTerm` (`@@map("glossary_terms")`) in
+  `prisma/schema.prisma`, migrated via `prisma migrate dev` against
+  `DIRECT_URL` (migration `20260919102204_add_glossary_terms`). Keyed on
+  `(source_text_lower, target_lang)` unique constraint — stripped +
+  lowercased text, deliberately different from the static `GLOSSARY`
+  dict's raw-whitespace-preserving keys (see `api/translation_cache.py`'s
+  docstring for why). **No Prisma Python client exists** — runtime
+  reads/writes from `api/*.py` go through `pg8000` directly (`api/db.py`),
+  not Prisma; Prisma only owns schema/migrations here.
+- **New files**: `api/db.py` (pg8000 connection helper — see the native-
+  extension note below for why pg8000, not psycopg), `api/translation_cache.py`
+  (cache lookup/save, fails soft on any DB error), `api/gemini_translate.py`
+  (Gemini REST client — see below for why raw REST, not the `google-genai`
+  SDK — with a system prompt built from the static glossary for
+  consistency/homograph guidance, chunking + in-process pacing to respect
+  free-tier rate limits, retry with backoff on 429/5xx, never raises past
+  a single chunk's failure).
+- **IMPORTANT, non-obvious, cost real debugging time this session: don't
+  add Python dependencies with compiled/native extensions to `api/*.py`
+  without testing them through real `vercel dev` first**, not just a
+  local venv. `google-genai` (pulls in `pydantic`/`pydantic-core`, a
+  compiled Rust extension) and `psycopg[binary]` (compiled `libpq`/
+  `psycopg_c`) both imported and worked fine in a plain local venv, then
+  crashed **every single request** on real `vercel dev` with
+  `NO_RESPONSE_FROM_FUNCTION` / `ModuleNotFoundError: No module named
+  'pydantic_core._pydantic_core'` and, after removing that, `ImportError:
+  no pq wrapper available` — a platform mismatch between whatever
+  built the wheel and Vercel's actual Python function runtime. This is a
+  known, recurring, *unresolved* problem for these specific packages on
+  Vercel (see Vercel community forum / pydantic GitHub issues), not
+  something specific to this repo's setup, and per those threads it can
+  also bite real deployments, not just local `vercel dev` emulation.
+  Fixed by dropping both for pure-Python alternatives: `gemini_translate.py`
+  now calls the Gemini REST API directly via `urllib` (same pattern as
+  `api/blob.py`'s hand-rolled Vercel Blob client — verify the REST
+  contract with a real `curl` call first, same as blob.py's docstring
+  describes doing), and `api/db.py` uses `pg8000` (pure Python, DB-API
+  2.0, parses `DATABASE_URL` by hand since it has no built-in DSN
+  parsing, needs an explicit `certifi`-based SSL context for the same
+  "ambient CA bundle unreliable" reason as blob.py — see its docstring).
+  **`pg8000.dbapi.Cursor` has no context-manager protocol** (unlike
+  psycopg's) — don't write `with conn.cursor() as cur:`, just
+  `cur = conn.cursor()`. If a future session adds another Python
+  dependency, treat "does it ship a compiled extension" as a real risk
+  factor and confirm via a real `vercel dev` request (clear
+  `.vercel/cache` + `api/__pycache__` first, or it'll silently keep
+  serving the previous build) before assuming a clean local venv install
+  means it'll work.
+- **Changed**: `api/classify_translate.py` gets `_apply_llm_fallback`,
+  run once per document (not per-page — dedup needs cross-page
+  visibility) after the existing 3 tiers; `api/translate.py`'s
+  `DEFAULT_TARGET_LANG` comment updated (still `"de"` as default, but
+  `es`/`fr` are now real, just with less static glossary coverage
+  initially); `app/page.tsx` gets a DE/ES/FR language toggle (was
+  hardcoded to `?lang=de`).
+- **Model note**: `gemini-2.5-flash-lite` (the model originally planned,
+  for its free-tier limits) returned `404 NOT_FOUND` on `generate_content`
+  for this project's API key — "no longer available to new users," despite
+  still appearing in the `/models` listing. Don't reintroduce it. Live
+  model list confirmed the actual available lite model + exact ID via
+  `GET /v1beta/models` (don't trust training-data model names or search
+  results for this — Google changes free-tier model availability without
+  much notice): **`gemini-3.1-flash-lite`**, confirmed against this
+  account's real AI Studio dashboard, 2026-09-19: 15 req/min, 500 req/day,
+  250k tokens/min. That's what `gemini_translate.py`'s `MODEL` constant
+  and throttling constants (`_MIN_SECONDS_BETWEEN_CALLS`,
+  `_MAX_TOKENS_PER_CHUNK`) are tuned for now.
+- **Verified against `reference/sample_plan.pdf`, all 3 languages, with
+  real Gemini calls** (not mocked): German unchanged from the
+  pre-existing baseline (348 glossary_match, 165 code, 16 mixed — the 4
+  previously-`unmatched` spans now correctly `llm_match` via Gemini,
+  coherent translation). Spanish and French (zero static glossary
+  coverage) both went from 0 static coverage to 368/533 spans correctly
+  `llm_match` in a single Gemini call each. Postgres cache verified two
+  ways: direct save/lookup against the real Neon DB, and a full second
+  pipeline run with `gemini_translate.translate_batch` monkey-patched to
+  raise if called at all — it wasn't, confirming cache hits actually skip
+  the API rather than just returning the same answer coincidentally.
+  Also verified with a REAL end-to-end request through real `vercel dev`
+  (not just direct Python calls in a venv) — uploaded the sample PDF to
+  Blob, POSTed to `/api/translate?lang=de`, got a 200 with a real
+  `download_url`, downloaded and rendered it. This is what caught the
+  native-extension issue above; direct-venv testing alone did not.
+- **Bug found and fixed via this testing**: `reinsert.py`'s `refit_span`
+  only updated `used_font_size` inside the "found a fit" branch of its
+  shrink loop, so a translation that never fit even at the shrink floor
+  silently rendered at the full, un-shrunk original size — worse than
+  the floor size, and the opposite of CLAUDE.md's "shrink to a floor
+  before flagging" spec. Pre-existing, but invisible until Gemini-fallback
+  French/Spanish text (longer than the length-conscious hand-curated
+  German glossary) visibly ran a page-1 heading off the right edge in a
+  rendered PNG check. Fixed with a `while/else`: render at the floor size
+  when the loop never finds a fit. Re-verified by re-rendering — heading
+  now fits; `needs_review`/`overflow` flags still correctly fire. See
+  `reinsert.py`'s own docstring for the full note.
+- **Real infra provisioned this session** (previously placeholders):
+  Neon Postgres (created directly at neon.tech, NOT via
+  `vercel integration add neon` — that marketplace billing path reportedly
+  has no hard spend cap once free tier is exceeded, whereas Neon's own
+  direct free tier is hard-capped with no card on file). `DATABASE_URL`
+  (pooled, `-pooler` hostname) / `DIRECT_URL` (direct) are real now, in
+  `.env.local` and all three Vercel environments. `GEMINI_API_KEY` (Google
+  AI Studio, free tier) likewise real in both places.
+
+The natural next slice after this lands (per CLAUDE.md's suggested branch
 order, adjusted for what's already built) is one of:
 - `feature/auth` — NextAuth/Auth.js + Google OAuth, `drive.file` scope only.
   `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/`NEXTAUTH_URL`

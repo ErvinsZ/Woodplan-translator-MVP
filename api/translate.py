@@ -41,8 +41,11 @@ from classify_translate import classify_translate_document
 from reinsert import reinsert_and_export
 from blob import upload_blob, download_blob, delete_blob
 
-# Only language with glossary data today (CLAUDE.md: build German
-# end-to-end first, generalize later).
+# German has the deepest static glossary coverage (CLAUDE.md: built
+# end-to-end first). Spanish/French are supported the same way but start
+# with little/no static coverage, so most of their text routes through
+# classify_translate.py's Gemini fallback tier until their own dynamic
+# cache (glossary_terms) fills in from real usage.
 DEFAULT_TARGET_LANG = "de"
 
 
