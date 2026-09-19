@@ -4,8 +4,20 @@ Only called for spans neither the static glossary (api/glossary.py) nor
 the dynamic cache (api/translation_cache.py) cover. Always sends full-
 sentence context -- never called per-word -- specifically to resolve
 homographs correctly ("board" a piece of lumber vs. "board" a ship),
-which is the whole reason a naive word-by-word fallback would be worse
-than no fallback at all.
+which is the whole reason a naive per-word fallback would be worse than
+no fallback at all.
+
+Talks to the REST API directly via urllib rather than the official
+`google-genai` SDK -- same reasoning as api/blob.py's hand-rolled Vercel
+Blob client: `google-genai` pulls in `pydantic`/`pydantic-core`, which
+ships a compiled Rust extension. That crashed every invocation of this
+whole pipeline with `ModuleNotFoundError: No module named
+'pydantic_core._pydantic_core'` (found via `vercel dev`, confirmed to be
+a known, recurring, unresolved issue on real Vercel Python deployments
+too, not just local emulation -- see Vercel community/pydantic GitHub
+threads). The REST contract itself is simple (one POST, JSON in/out) and
+was verified directly with curl before writing this, the same way
+blob.py's contract was reverse-engineered rather than guessed.
 
 Model: gemini-3.1-flash-lite (Google AI Studio free tier). NOTE:
 gemini-2.5-flash-lite -- the model originally targeted -- returned a 404
@@ -18,28 +30,29 @@ live AI Studio dashboard (not just this comment) if these numbers ever
 look wrong, and don't assume a model name from training data or search
 results is actually usable without checking the real /models response or
 the dashboard first.
-
-Rate limiting here is IN-PROCESS ONLY: it keeps a single
-`translate_batch` call under the per-minute ceiling by itself, with no
-coordination across concurrent invocations. That's a deliberate MVP-scope
-decision (see PROJECT_STATE.md) -- there's no auth/multi-tenancy yet, so
-there's no real concurrent load to coordinate against. Revisit with a
-shared limiter (e.g. Upstash Redis) once feature/auth ships.
 """
 
 import json
 import os
+import ssl
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import certifi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from google import genai
-from google.genai import errors, types
 
 from glossary import GLOSSARY
 
 MODEL = "gemini-3.1-flash-lite"
+_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Same certifi-based SSL context as blob.py, for the same reason: some
+# Python-runtime environments don't have a system CA bundle linked.
+_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 _LANGUAGE_NAMES = {"de": "German", "es": "Spanish", "fr": "French"}
 
@@ -60,6 +73,7 @@ _MIN_SECONDS_BETWEEN_CALLS = 4.5
 _MAX_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = (2, 6)
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
+_REQUEST_TIMEOUT_SECONDS = 60
 
 _RESPONSE_JSON_SCHEMA = {
     "type": "array",
@@ -74,11 +88,17 @@ _RESPONSE_JSON_SCHEMA = {
 }
 
 
-def _client():
+class _GeminiError(Exception):
+    def __init__(self, code, message):
+        super().__init__(f"Gemini API error {code}: {message}")
+        self.code = code
+
+
+def _api_key():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    return genai.Client(api_key=api_key)
+    return api_key
 
 
 def _system_instruction(target_lang):
@@ -130,21 +150,36 @@ def _chunk(pairs):
         yield chunk
 
 
-def _call_gemini(client, system_instruction, chunk):
-    contents = json.dumps(
+def _call_gemini(api_key, system_instruction, chunk):
+    contents_text = json.dumps(
         [{"id": item_id, "text": text} for item_id, text in chunk],
         ensure_ascii=False,
     )
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_json_schema=_RESPONSE_JSON_SCHEMA,
-        ),
+    payload = {
+        "contents": [{"parts": [{"text": contents_text}]}],
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": _RESPONSE_JSON_SCHEMA,
+        },
+    }
+    url = f"{_API_URL}/{MODEL}:generateContent?key={urllib.parse.quote(api_key)}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    parsed = json.loads(response.text)
+    try:
+        with urllib.request.urlopen(
+            request, context=_SSL_CONTEXT, timeout=_REQUEST_TIMEOUT_SECONDS
+        ) as response:
+            body = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        raise _GeminiError(exc.code, exc.read().decode()) from exc
+
+    text = body["candidates"][0]["content"]["parts"][0]["text"]
+    parsed = json.loads(text)
     return {item["id"]: item["translation"] for item in parsed}
 
 
@@ -160,7 +195,7 @@ def translate_batch(pairs, target_lang):
     if not pairs:
         return {}
 
-    client = _client()
+    api_key = _api_key()
     system_instruction = _system_instruction(target_lang)
     results = {}
     last_call_at = 0.0
@@ -173,9 +208,16 @@ def translate_batch(pairs, target_lang):
         for attempt in range(_MAX_RETRIES + 1):
             last_call_at = time.monotonic()
             try:
-                results.update(_call_gemini(client, system_instruction, chunk))
+                results.update(_call_gemini(api_key, system_instruction, chunk))
                 break
-            except (errors.APIError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            except (
+                _GeminiError,
+                urllib.error.URLError,
+                json.JSONDecodeError,
+                KeyError,
+                IndexError,
+                TypeError,
+            ) as exc:
                 code = getattr(exc, "code", None)
                 retryable = code in _RETRYABLE_CODES
                 if not retryable or attempt == _MAX_RETRIES:

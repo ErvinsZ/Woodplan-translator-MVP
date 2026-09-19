@@ -123,7 +123,10 @@ translators that don't understand dimensioned technical drawings.
   (project-level file — global npm config does NOT have this set, don't
   rely on it).
 - **Python deps**: `requirements.txt` at repo root, pinned exact versions
-  (`pymupdf==1.28.2`, `certifi==2026.7.22`). No venv checked in; Vercel's
+  (`pymupdf==1.28.2`, `certifi==2026.7.22`, `pg8000==1.31.5`). No compiled/
+  native-extension packages (see §6's note on why — `psycopg`/
+  `google-genai` both broke real `vercel dev` despite working in a local
+  venv). No venv checked in; Vercel's
   `uv`-based builder provisions one per function at build time.
 - **Design system**: warm "drafting paper" palette (see globals.css tokens),
   Space Grotesk (display) + IBM Plex Mono (labels/mono), explicitly avoiding
@@ -228,8 +231,8 @@ translators that don't understand dimensioned technical drawings.
 ## 6. What's in progress
 
 **Dynamic Gemini-backed translation + Spanish/French support** — built and
-verified this session, **not yet committed** (working tree on `dev`, no
-feature branch cut yet — ask before committing/branching). Plan lives at
+verified this session, committed to `feature/dynamic-translation` (not
+merged/pushed yet). Plan lives at
 `~/.claude/plans/wiggly-imagining-stream.md`. Adds a 4th classify/translate
 tier: spans the static glossary misses now check a Postgres-backed dynamic
 cache (`glossary_terms` table) first, then fall back to a Gemini API call
@@ -257,14 +260,47 @@ cache instead of calling the API again.
   lowercased text, deliberately different from the static `GLOSSARY`
   dict's raw-whitespace-preserving keys (see `api/translation_cache.py`'s
   docstring for why). **No Prisma Python client exists** — runtime
-  reads/writes from `api/*.py` go through `psycopg` directly
-  (`api/db.py`), not Prisma; Prisma only owns schema/migrations here.
-- **New files**: `api/db.py` (psycopg connection helper),
-  `api/translation_cache.py` (cache lookup/save, fails soft on any DB
-  error), `api/gemini_translate.py` (Gemini client wrapper: system prompt
-  built from the static glossary for consistency/homograph guidance,
-  chunking + in-process pacing to respect free-tier rate limits, retry
-  with backoff on 429/5xx, never raises past a single chunk's failure).
+  reads/writes from `api/*.py` go through `pg8000` directly (`api/db.py`),
+  not Prisma; Prisma only owns schema/migrations here.
+- **New files**: `api/db.py` (pg8000 connection helper — see the native-
+  extension note below for why pg8000, not psycopg), `api/translation_cache.py`
+  (cache lookup/save, fails soft on any DB error), `api/gemini_translate.py`
+  (Gemini REST client — see below for why raw REST, not the `google-genai`
+  SDK — with a system prompt built from the static glossary for
+  consistency/homograph guidance, chunking + in-process pacing to respect
+  free-tier rate limits, retry with backoff on 429/5xx, never raises past
+  a single chunk's failure).
+- **IMPORTANT, non-obvious, cost real debugging time this session: don't
+  add Python dependencies with compiled/native extensions to `api/*.py`
+  without testing them through real `vercel dev` first**, not just a
+  local venv. `google-genai` (pulls in `pydantic`/`pydantic-core`, a
+  compiled Rust extension) and `psycopg[binary]` (compiled `libpq`/
+  `psycopg_c`) both imported and worked fine in a plain local venv, then
+  crashed **every single request** on real `vercel dev` with
+  `NO_RESPONSE_FROM_FUNCTION` / `ModuleNotFoundError: No module named
+  'pydantic_core._pydantic_core'` and, after removing that, `ImportError:
+  no pq wrapper available` — a platform mismatch between whatever
+  built the wheel and Vercel's actual Python function runtime. This is a
+  known, recurring, *unresolved* problem for these specific packages on
+  Vercel (see Vercel community forum / pydantic GitHub issues), not
+  something specific to this repo's setup, and per those threads it can
+  also bite real deployments, not just local `vercel dev` emulation.
+  Fixed by dropping both for pure-Python alternatives: `gemini_translate.py`
+  now calls the Gemini REST API directly via `urllib` (same pattern as
+  `api/blob.py`'s hand-rolled Vercel Blob client — verify the REST
+  contract with a real `curl` call first, same as blob.py's docstring
+  describes doing), and `api/db.py` uses `pg8000` (pure Python, DB-API
+  2.0, parses `DATABASE_URL` by hand since it has no built-in DSN
+  parsing, needs an explicit `certifi`-based SSL context for the same
+  "ambient CA bundle unreliable" reason as blob.py — see its docstring).
+  **`pg8000.dbapi.Cursor` has no context-manager protocol** (unlike
+  psycopg's) — don't write `with conn.cursor() as cur:`, just
+  `cur = conn.cursor()`. If a future session adds another Python
+  dependency, treat "does it ship a compiled extension" as a real risk
+  factor and confirm via a real `vercel dev` request (clear
+  `.vercel/cache` + `api/__pycache__` first, or it'll silently keep
+  serving the previous build) before assuming a clean local venv install
+  means it'll work.
 - **Changed**: `api/classify_translate.py` gets `_apply_llm_fallback`,
   run once per document (not per-page — dedup needs cross-page
   visibility) after the existing 3 tiers; `api/translate.py`'s
@@ -295,6 +331,11 @@ cache instead of calling the API again.
   pipeline run with `gemini_translate.translate_batch` monkey-patched to
   raise if called at all — it wasn't, confirming cache hits actually skip
   the API rather than just returning the same answer coincidentally.
+  Also verified with a REAL end-to-end request through real `vercel dev`
+  (not just direct Python calls in a venv) — uploaded the sample PDF to
+  Blob, POSTed to `/api/translate?lang=de`, got a 200 with a real
+  `download_url`, downloaded and rendered it. This is what caught the
+  native-extension issue above; direct-venv testing alone did not.
 - **Bug found and fixed via this testing**: `reinsert.py`'s `refit_span`
   only updated `used_font_size` inside the "found a fit" branch of its
   shrink loop, so a translation that never fit even at the shrink floor

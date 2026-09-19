@@ -38,16 +38,18 @@ def lookup_many(stripped_texts, target_lang):
 
     try:
         with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT source_text_lower, translation
-                    FROM glossary_terms
-                    WHERE source_text_lower = ANY(%s) AND target_lang = %s
-                    """,
-                    (list(normalized), target_lang),
-                )
-                return dict(cur.fetchall())
+            # pg8000's Cursor has no context-manager protocol, unlike
+            # psycopg's -- plain cursor(), no `with`.
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT source_text_lower, translation
+                FROM glossary_terms
+                WHERE source_text_lower = ANY(%s) AND target_lang = %s
+                """,
+                (list(normalized), target_lang),
+            )
+            return dict(cur.fetchall())
     except Exception as exc:
         print(f"translation_cache: lookup failed ({exc!r}), treating as cache miss", file=sys.stderr)
         return {}
@@ -70,16 +72,16 @@ def save_many(entries, target_lang, model_name):
 
     try:
         with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO glossary_terms
-                        (source_text, source_text_lower, target_lang, translation, model)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (source_text_lower, target_lang) DO NOTHING
-                    """,
-                    rows,
-                )
+            cur = conn.cursor()
+            cur.executemany(
+                """
+                INSERT INTO glossary_terms
+                    (source_text, source_text_lower, target_lang, translation, model)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (source_text_lower, target_lang) DO NOTHING
+                """,
+                rows,
+            )
             conn.commit()
     except Exception as exc:
         print(f"translation_cache: save failed ({exc!r}), translations still applied this run", file=sys.stderr)
