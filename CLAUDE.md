@@ -121,6 +121,34 @@ pixels**. This means:
    on whitespace/punctuation, classify each token, preserve codes as-is,
    translate only real words.
 
+6. **`page.apply_redactions()`'s default `images=2` ("blank out
+   overlapping image parts") bakes a visible boundary artifact onto the
+   page wherever a redaction rect merely touches a raster image's
+   bounding box** — even when no diagram pixels are visibly "under" the
+   text being redacted. Root-caused by toggling `apply_redactions`'s
+   `images=`/`graphics=` params independently against real sample pages
+   and diffing pixel values: only `images=2` produced it, `images=0` and
+   `images=1` never did, and `add_redact_annot(..., cross_out=...)` made
+   no difference either way. Always pass `images=0` when redacting near a
+   diagram — this pipeline never intends to touch image content during
+   redaction in the first place, so there's no case where the default's
+   blanking behavior is actually wanted.
+
+7. **A translated span that still overflows even at the shrink floor
+   must not be rendered as a single unclipped `insert_text` line** — it
+   runs straight past its own column border and paints over whatever
+   sits to the right (neighboring cell text, or a diagram), and
+   `needs_review` being set doesn't stop the bad render from shipping
+   (no review UI exists yet — see PROJECT_STATE.md). Before falling back
+   to wrapping (which risks overlapping the diagram/next line below) or
+   bleeding, try shrinking well past the normal 75-80% floor (down to
+   ~40% of original / a ~6pt absolute minimum) to see if the whole
+   translation still fits back on the span's ORIGINAL single line —
+   scanning every page of the real sample PDF found this alone resolves
+   the large majority of real overflow cases, since most are short
+   labels where the target language just runs a bit longer, not whole
+   extra sentences.
+
 ## Tech stack decisions
 
 - **Frontend/hosting**: Next.js on Vercel.

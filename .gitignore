@@ -46,3 +46,10 @@ next-env.d.ts
 
 /app/generated/prisma
 .env.local
+
+# local scratch test fixtures (real pipeline output used for debugging,
+# not permanent reference fixtures -- kept local, not committed)
+/reference/sample_plan_2.pdf
+/reference/sample_plan_2_broken.pdf
+/reference/sample_plan_broken_de.pdf
+/reference/sample_plan_broken_es.pdf
