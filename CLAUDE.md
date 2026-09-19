@@ -241,12 +241,20 @@ pixels**. This means:
   datasource url/directUrl pattern). `directUrl` was REMOVED from `schema.prisma`
   in v7 — do not add it there.
 - **CLI commands** (`db push`, `migrate`) read `datasource.url` from
-  `prisma.config.ts`, which is pointed at **`DIRECT_URL`** (Supabase direct
-  connection, port 5432). This is required — running migrations/DDL through the
-  pooled transaction connection (port 6543) HANGS silently because PgBouncer in
-  transaction mode can't handle the session-level locks Prisma needs.
-- **Runtime Prisma Client uses the POOLED `DATABASE_URL`** (port 6543,
-  `?pgbouncer=true`) — correct for many concurrent serverless connections.
+  `prisma.config.ts`, which is pointed at **`DIRECT_URL`** (the direct,
+  non-pooled connection). This is required — running migrations/DDL
+  through a pooled transaction-mode connection HANGS silently because
+  PgBouncer (or equivalent) in transaction mode can't handle the
+  session-level locks Prisma needs.
+- **Runtime Prisma Client uses the POOLED `DATABASE_URL`** — correct for
+  many concurrent serverless connections. This project runs on **Neon**
+  (as of the dynamic-translation feature — see PROJECT_STATE.md for why
+  Neon, signed up directly rather than via Vercel Marketplace), whose
+  pooling is **hostname-based** (`-pooler` suffix on the host, same port)
+  — NOT the port-based split (6543 pooled / 5432 direct) that Supabase
+  uses. Don't assume the port-based pattern if this project ever
+  reconnects to Supabase or another provider instead; check that
+  provider's own docs for how it distinguishes pooled vs. direct.
 - **Prisma 7 REQUIRES a driver adapter to instantiate the client.**
   `new PrismaClient()` alone DOES NOT WORK in v7. Correct pattern:
 ```typescript
@@ -265,12 +273,41 @@ pixels**. This means:
 - `prisma.config.ts` explicitly loads `.env.local` via
   `config({ path: ".env.local" })` at the top, because the default `dotenv/config`
   import only reads `.env`, not `.env.local`.
-- Env vars: `DATABASE_URL` (pooled, 6543), `DIRECT_URL` (direct, 5432),
-  plus NextAuth + Google OAuth + `ANTHROPIC_API_KEY`. All must also be set in
-  Vercel's project environment variables for deploys.
+- Env vars: `DATABASE_URL` (pooled), `DIRECT_URL` (direct) — see the Prisma
+  7 section above for how pooled/direct are distinguished on this
+  project's actual provider (Neon, hostname-based) — plus NextAuth +
+  Google OAuth + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY`. All must also be
+  set in Vercel's project environment variables for deploys.
 
 ### Package manager
 - This project uses **npm**, not pnpm. Use npm commands throughout.
+
+### Python dependencies on Vercel (compiled extensions break at runtime)
+- NEVER add a Python package with a compiled/native extension to
+  `api/*.py`'s `requirements.txt` without testing it via a REAL
+  `vercel dev` request first — a clean install in a plain local venv
+  proves nothing about whether it'll actually run. `google-genai` (pulls
+  in `pydantic`/`pydantic-core`, a compiled Rust extension) and
+  `psycopg[binary]` (compiled `libpq`/`psycopg_c`) both installed and
+  imported fine in a local venv, then crashed EVERY request on real
+  `vercel dev` with `NO_RESPONSE_FROM_FUNCTION`
+  (`ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'`,
+  then `ImportError: no pq wrapper available`) — a platform mismatch
+  between the built wheel and Vercel's actual Python function runtime.
+  This is a known, recurring, *unresolved* issue for these specific
+  packages on Vercel (see Vercel's own community forum and pydantic's
+  GitHub issues), not specific to this repo, and it can also affect real
+  deployments, not just local `vercel dev` emulation.
+- Fixed by using pure-Python alternatives instead: raw REST via `urllib`
+  for the Gemini API (`api/gemini_translate.py`, same pattern as
+  `api/blob.py`'s hand-rolled Vercel Blob client — no official SDK
+  needed) and `pg8000` (pure Python, DB-API 2.0) for Postgres instead of
+  `psycopg` (`api/db.py`).
+- Before trusting a new Python dependency, check whether it ships a
+  compiled extension, and confirm it with a real request against
+  `npm run dev:full` — clear `.vercel/cache` and `api/__pycache__` first,
+  or `vercel dev` will silently keep serving the previous build and hide
+  the problem.
 
 ---
 
