@@ -2,6 +2,18 @@
 
 ---
 
+Read PROJECT_STATE.md in full before doing any work in this repo, at the start
+of every session — this file (CLAUDE.md) is loaded automatically, but
+PROJECT_STATE.md is not, and it has the actual current architecture, decisions
+made and why, and what's in progress. Don't rely on stumbling onto it.
+
+Keep PROJECT_STATE.md up to date as we work. After completing any meaningful 
+step (finishing a feature, making an architectural decision, fixing a bug), 
+update the relevant section rather than waiting to be asked. Keep it concise — 
+this file should always reflect current reality, not a history log.
+
+---
+
 # Project: Woodworking Plan Localization SaaS (MVP)
 
 ## What this is
