@@ -298,14 +298,58 @@ pixels**. This means:
 - `.env.local` is the SINGLE source of truth for secrets (gitignored). There is
   no `.env` file — it was deleted to avoid Prisma silently loading placeholder
   values from it.
-- `prisma.config.ts` explicitly loads `.env.local` via
+- `prisma7.config.ts` (yes, that literal filename — not `prisma.config.ts`;
+  Prisma's CLI auto-detects it without needing a `--config` flag, confirmed
+  via `npx prisma validate`) explicitly loads `.env.local` via
   `config({ path: ".env.local" })` at the top, because the default `dotenv/config`
   import only reads `.env`, not `.env.local`.
 - Env vars: `DATABASE_URL` (pooled), `DIRECT_URL` (direct) — see the Prisma
   7 section above for how pooled/direct are distinguished on this
   project's actual provider (Neon, hostname-based) — plus NextAuth +
-  Google OAuth + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY`. All must also be
-  set in Vercel's project environment variables for deploys.
+  Google OAuth (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/
+  `NEXTAUTH_URL`) + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY`. All must also be
+  set in Vercel's project environment variables for deploys — see the
+  Vercel env var subsection below for two non-obvious ways to get that
+  wrong.
+
+### Vercel environment variables (per-environment values, not just presence)
+- **A var that must differ per environment (e.g. `NEXTAUTH_URL`) needs a
+  SEPARATE `vercel env add <NAME> <environment>` call per environment.**
+  Selecting multiple environments (Production + Preview + Development) in
+  one `vercel env add` prompt applies the exact same value to all of
+  them — fine for a var like `GOOGLE_CLIENT_ID` that's genuinely the same
+  everywhere, silently wrong for one that isn't. Caught via `vercel env
+  ls`'s own row-grouping: it collapses genuinely-identical values into
+  one row spanning multiple environments, and splits into separate rows
+  when values differ (confirmed by contrast — `DATABASE_URL`/
+  `DIRECT_URL` show as three separate per-environment rows despite also
+  being added around the same time as each other). If a var that should
+  vary shows as one row spanning multiple environments, that's the bug.
+  Fix: `vercel env rm <NAME> <environment>` for the affected scopes, then
+  re-add each one individually with its own value.
+- **This project's `NEXTAUTH_URL` is three genuinely different values,
+  one per environment** — Production is the production domain, Preview
+  is the `dev` branch's stable git-branch alias (`<project>-git-dev-
+  <team>.vercel.app` — NOT a per-deployment hash URL, which changes on
+  every push and can't practically be kept registered in Google Cloud
+  Console's exact-match redirect URI list), Development is
+  `http://localhost:3000`. Each of those three URLs also needs its own
+  `.../api/auth/callback/google` entry registered in Google Cloud
+  Console's OAuth client — Google requires an exact match per redirect
+  URI, no wildcards.
+- **`vercel env pull` will NOT reveal real values for `Secret`-type vars
+  outside the `development` scope.** Pulling `production` or `preview`
+  writes the literal placeholder string `"[SENSITIVE]"` in place of each
+  Secret var's real value (confirmed via `vercel env pull
+  --environment=production`'s own stderr: `"N Secret values cannot be
+  pulled from the ... Environment. Wrote [SENSITIVE] as placeholders"`).
+  Comparing two pulled Production/Preview files (or hashing specific
+  lines from them) to check whether a Secret var holds the same value in
+  both environments will falsely report them as identical even when the
+  real values differ — both files just contain the same placeholder
+  text. Don't use that method to verify secret equality across
+  environments; trust `vercel env ls`'s row-grouping instead (see above),
+  or check the dashboard directly.
 
 ### Package manager
 - This project uses **npm**, not pnpm. Use npm commands throughout.
