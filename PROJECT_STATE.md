@@ -1,12 +1,16 @@
 # Project State
 
-Last updated: 2026-09-19, after a second pass fixing `reinsert.py`
-rendering bugs (redaction border artifact over diagrams; hardcoded font;
-overflow bleed/wrap-into-diagram, resolved via a deep-shrink-first
-fallback) plus one `glossary.py` content rebalance, verified against real
-broken-output repros the user generated locally — not yet on a merged
-branch, see §6. Previous entries: after merging dynamic Gemini translation
-+ Spanish/French support (PR #4).
+Last updated: 2026-09-19, after adding user database + Google
+authentication on `feature/google-auth` (branched off `dev`) and
+provisioning its env vars in Vercel — see §5/§6. Not yet committed/
+pushed/merged as of this entry (user is doing that manually).
+Previous entries: a second pass fixing `reinsert.py` rendering bugs
+(redaction border artifact over diagrams; hardcoded font; overflow
+bleed/wrap-into-diagram, resolved via a deep-shrink-first fallback) plus
+one `glossary.py` content rebalance, verified against real broken-output
+repros the user generated locally — not yet on a merged branch as of that
+entry, see §6. Before that: merged dynamic Gemini translation +
+Spanish/French support (PR #4).
 See `CLAUDE.md` for the original plan/spec; this file tracks actual current state,
 which has diverged from and extended that plan in places noted below.
 
@@ -122,6 +126,28 @@ translators that don't understand dimensioned technical drawings.
   `--foreground`, `--paper`, `--line`, `--line-strong`, `--accent`,
   `--blueprint`, `--muted`), light + dark variants, exposed to Tailwind v4 via
   `@theme inline`. Dot-grid background texture on `body`.
+- `app/providers.tsx` — client component wrapping `children` in next-auth's
+  `SessionProvider`, mounted in `app/layout.tsx` around the whole `<body>`.
+- `app/components/AuthStatus.tsx` — client component using `useSession`;
+  renders a "Sign in with Google" button (top-right bar in `layout.tsx`) or
+  the signed-in email + "Sign out". No route is gated behind auth yet — the
+  upload/translate flow on `/` still works fully signed-out, same as
+  before. This is intentional for now: this session only wired up
+  identity/DB, not access control — see §6.
+- `lib/prisma.ts` — Prisma Client singleton for the **Node/Next.js** side
+  (distinct from `api/db.py`'s pg8000 connection, which is Python-only and
+  unrelated). Uses `@prisma/adapter-pg` + pooled `DATABASE_URL`, per
+  CLAUDE.md's Prisma 7 driver-adapter requirement. Cached on
+  `globalThis` to survive Next dev's hot-reload without exhausting Neon's
+  connection pool.
+- `lib/auth.ts` — next-auth v4 `authOptions`: `PrismaAdapter` (from
+  `@auth/prisma-adapter`, NOT the older/deprecated
+  `@next-auth/prisma-adapter`), Google provider, **database** session
+  strategy (not JWT) so sessions persist in Postgres across stateless
+  function invocations. `session` callback copies `user.id` onto
+  `session.user.id` (typed via `types/next-auth.d.ts`).
+- `app/api/auth/[...nextauth]/route.ts` — the NextAuth App Router handler
+  (`NextAuth(authOptions)`, exported as both `GET`/`POST`).
 
 **Reference/test fixtures (not app code):**
 - `reference/sample_plan.pdf` — real 15-page Etsy plan, the only test input
@@ -167,11 +193,22 @@ translators that don't understand dimensioned technical drawings.
 - **Storage**: Vercel Blob (`woodplan-translator-blob` store, **public**
   access — see §4 for why) for PDFs in/out. Postgres (Neon, provisioned
   directly at neon.tech — see §4 for why not via Vercel Marketplace) for
-  the dynamic translation-memory cache (`glossary_terms` table via
-  Prisma's `schema.prisma`/migrations — no other tables yet, no
-  users/documents/pages schema; that's still `feature/db-schema`'s job).
+  both the dynamic translation-memory cache (`glossary_terms` table) and,
+  as of this session, Auth.js identity tables (`users`, `accounts`,
+  `sessions`, `verification_tokens`) — same `prisma/schema.prisma`/
+  migrations, same Neon database. The full `documents -> pages ->
+  text_boxes` schema CLAUDE.md describes is still NOT built, only identity
+  tables exist so far — see §6.
   `DATABASE_URL` (pooled) / `DIRECT_URL` (direct) are real, in `.env.local`
   and all three Vercel environments.
+- **Auth**: next-auth v4.24 (`next-auth`) + `@auth/prisma-adapter` (the
+  current, non-deprecated Prisma adapter package — NOT the older
+  `@next-auth/prisma-adapter`), Google OAuth provider only, **database**
+  session strategy. `lib/prisma.ts` is the Node-side Prisma Client
+  (driver-adapter pattern, `@prisma/adapter-pg` + pooled `DATABASE_URL`) —
+  entirely separate from `api/db.py`'s pg8000 connection used by the
+  Python pipeline; both point at the same Neon database but are two
+  independent client stacks (Node vs. Python), don't conflate them.
 - **Package manager**: npm, not pnpm. `save-exact=true` via `.npmrc`
   (project-level file — global npm config does NOT have this set, don't
   rely on it).
@@ -353,8 +390,10 @@ translators that don't understand dimensioned technical drawings.
   both pass clean.
 - Vercel Blob store provisioned and connected (`woodplan-translator-blob`,
   public, static `BLOB_READ_WRITE_TOKEN` + OIDC both available). Neon
-  Postgres provisioned and connected (`glossary_terms` table only — see §4
-  for why global/unscoped and why signed up directly at neon.tech).
+  Postgres provisioned and connected (`glossary_terms` table, plus the
+  Auth.js identity tables as of this session — see §4 for why the
+  glossary cache is global/unscoped and why Neon was signed up directly
+  at neon.tech).
   `GEMINI_API_KEY` (Google AI Studio free tier) live in `.env.local` and
   all three Vercel environments.
 - Four PRs merged to `dev`: #1 (extraction), #2 (reinsertion/export +
@@ -364,8 +403,12 @@ translators that don't understand dimensioned technical drawings.
   all root-caused against real output from `reference/sample_plan.pdf`,
   `reference/sample_plan_2.pdf`, and broken-output repros the user
   generated locally (`reference/sample_plan_broken_{de,es}.pdf`,
-  `reference/sample_plan_2_broken.pdf` — not yet on a merged branch, see
-  §6):
+  `reference/sample_plan_2_broken.pdf`) — merged to `dev` via PR #5
+  (`feature/reinsert-render-fixes`). Those four extra PDFs ended up
+  **gitignored, not committed** (`88ed323`) — kept locally as scratch
+  repros, not checked in as permanent fixtures; only the original
+  `reference/sample_plan.pdf` and `reference/translated_output_example.pdf`
+  are tracked in git:
   1. A rectangular border baked onto the page wherever a reinserted
      span's redaction rect touched a diagram's raster image, root-caused
      to `apply_redactions()`'s default `images=2`; fixed by passing
@@ -403,51 +446,128 @@ translators that don't understand dimensioned technical drawings.
   the dashed layout-guide line; the Spanish title bleeding into the
   copyright column; "Cerrada" splitting mid-word) are now confirmed fixed
   by re-rendering the exact same real spans through the current code.
+- User database + Google authentication (this session, on
+  `feature/google-auth`, branched off `dev`): Auth.js identity tables
+  (`users`/`accounts`/`sessions`/`verification_tokens`) added to
+  `prisma/schema.prisma` and migrated onto the real Neon database
+  (migration `20260919174602_add_auth_tables`, applied via
+  `DIRECT_URL`/`prisma7.config.ts`); `lib/prisma.ts` + `lib/auth.ts` +
+  `app/api/auth/[...nextauth]/route.ts` wire next-auth v4 +
+  `@auth/prisma-adapter` + Google provider (database session strategy);
+  `app/providers.tsx` + `app/components/AuthStatus.tsx` add a real
+  sign-in/sign-out UI (top-right bar in `layout.tsx`). `npm run build`
+  and `npm run lint` both pass clean.
+  - **Verified against a real browser, not just a type-check**: started
+    `next dev`, drove headless Chromium (via a cached `npx playwright`
+    install — `chromium-cli` wasn't available in this environment) to
+    click "Sign in with Google", and confirmed the redirect actually
+    reaches Google with the real `client_id` from `.env.local` — Google's
+    own response was `Error 400: redirect_uri_mismatch` for
+    `http://localhost:3000/api/auth/callback/google`, which proves the
+    credentials are real (not placeholders, contra the previous
+    entry's assumption) and the whole provider/redirect wiring on this
+    end is correct. The mismatch itself is a one-time fix only the user
+    can do (their Google Cloud Console project) — see §7.
+  - Scope is intentionally narrow: identity/login only, no
+    `drive.file`/offline-access scope requested yet (so no
+    `refresh_token` is issued or stored yet — encrypting that column at
+    rest per CLAUDE.md is deferred until the Drive-upload feature
+    actually populates it), and no route/feature is gated behind
+    sign-in — the upload/translate flow on `/` still works fully
+    signed-out, unchanged. This session was "get identity + DB wired",
+    not "require login to use the tool."
+  - Not yet committed/pushed/PR'd — see §6.
 
 ## 6. What's in progress
 
-All `reinsert.py`/`glossary.py` fixes from §5 are complete and verified
-against real output, on **`feature/reinsert-render-fixes`** (branched off
-`dev`, not yet committed/pushed/PR'd — the branch exists but nothing has
-been committed to it yet; carries the same working-tree changes `dev` had
-uncommitted before the branch was created). Before committing: this is a
-bug fix to already-merged code rather than new feature work, so a direct
-squash-ish single commit is probably right per the usual PR convention,
-still opened as a normal PR into `dev` per CLAUDE.md's workflow.
-`reference/sample_plan_2.pdf` is also untracked (a second real test
-fixture, Calibri/Verdana-based, added to reproduce the border-artifact
-bug) along with three more real broken-output repros the user generated
-locally while testing this fix in progress —
-`reference/sample_plan_2_broken.pdf`,
-`reference/sample_plan_broken_de.pdf`,
-`reference/sample_plan_broken_es.pdf` — all four worth committing
-alongside if kept as permanent reference/regression fixtures (they're
-genuinely useful: every real bug found and fixed this session was
-root-caused directly against one of them, not guessed from screenshots
-alone).
+`feature/google-auth`'s changes (§5) are complete and build/lint clean,
+but **not yet committed** — working tree has the schema/migration/lib/app
+changes uncommitted on the branch. User is committing/pushing/merging
+this one manually (not delegated this time). Before committing: this is
+new feature work (not a bug fix to existing code), so per the usual
+convention it's one commit for the branch, opened as a normal PR into
+`dev`.
 
-Otherwise nothing else mid-edit. The natural next slice (per CLAUDE.md's
-suggested branch order, adjusted for what's already built) is one of:
-- `feature/auth` — NextAuth/Auth.js + Google OAuth, `drive.file` scope only.
-  `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/`NEXTAUTH_URL`
-  are already in `.env.local` but are placeholder/local-only — not yet
-  provisioned in Vercel project settings, not yet wired into any code.
-- Extending `feature/db-schema` beyond `glossary_terms` — the full
-  `users -> documents -> pages -> text_boxes` schema CLAUDE.md originally
-  described is still not started; only the standalone translation-cache
-  table exists so far. Depends on `feature/auth` existing first for
-  `users` to mean anything.
+Env var provisioning in Vercel is DONE and verified via `vercel env ls`
+(confirmed correct row-shape, not just "added"):
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `NEXTAUTH_SECRET`: one
+  shared value each, scoped to Production + Preview + Development (these
+  three don't need to differ per environment).
+- `NEXTAUTH_URL`: three **separate** entries with three different values
+  (this one DOES need to differ per environment) — Production ->
+  `https://woodplan-translator-mvp.vercel.app`, Preview -> the `dev`
+  branch's stable alias
+  `https://woodplan-translator-mvp-git-dev-ervins-projects-92f05673.vercel.app`
+  (NOT a per-deployment hash URL, which changes every push — the branch
+  alias is what stays constant), Development -> `http://localhost:3000`.
+  - This took two attempts: the first `vercel env add` selected all three
+    environments in one prompt, which gives ALL THREE the SAME value —
+    wrong for this specific var. Root-caused via `vercel env ls`'s own
+    row-grouping (it collapses genuinely-identical values into one row;
+    confirmed by contrast with `DATABASE_URL` etc., which stay as three
+    separate rows despite also being added around the same time). Fixed
+    by removing and re-adding each environment's `NEXTAUTH_URL`
+    separately with its own value. **If a var needs a different value
+    per environment, always `vercel env add <NAME> <environment>` one at
+    a time — never select multiple environments in one add.**
+  - Dead-end worth remembering: `vercel env pull` will NOT reveal real
+    values for **Secret**-type vars outside the `development` scope — it
+    writes the literal placeholder string `"[SENSITIVE]"` instead for
+    `production`/`preview` pulls. Comparing pulled Production/Preview
+    files (or their hashes) to check whether two Secret vars hold the
+    same value will falsely show them as identical (both are just the
+    same placeholder text) even when the real values differ. Don't use
+    that method again — trust `vercel env ls`'s row-grouping instead, or
+    check the dashboard directly.
+- Google Cloud Console redirect URIs: the `redirect_uri_mismatch` on
+  `http://localhost:3000/api/auth/callback/google` (found via the real
+  browser test in the §5 entry above) was reported back to the user as
+  needing a fix in their Google Cloud Console project — NOT something
+  fixable from this repo. **Not independently re-verified after that** —
+  the user moved on to the env var work before a follow-up browser test
+  confirmed the fix. Before trusting sign-in works anywhere, re-run (or
+  ask the user to confirm) that these three exact URIs are registered on
+  the OAuth client:
+  - `http://localhost:3000/api/auth/callback/google`
+  - `https://woodplan-translator-mvp-git-dev-ervins-projects-92f05673.vercel.app/api/auth/callback/google`
+  - `https://woodplan-translator-mvp.vercel.app/api/auth/callback/google`
+    (needed before the first real production deploy)
+
+The natural next slice after this branch merges, per CLAUDE.md's
+suggested branch order:
+- `feature/drive-upload` — add `drive.file` scope + offline access to the
+  Google provider config, encrypt the resulting `refresh_token` before
+  it's persisted (currently unencrypted-at-rest is fine only because no
+  refresh token exists yet — do this encryption step as part of, not
+  after, first requesting the scope). Per earlier session Q&A: it would
+  attach to the already-produced PDF bytes from `reinsert_and_export` in
+  `translate.py`, as an additional output destination alongside/instead
+  of the Blob upload — it wouldn't touch extraction/classification/
+  translation at all.
+- Extending the schema beyond identity tables — the full `documents ->
+  pages -> text_boxes` hierarchy CLAUDE.md originally described is still
+  not started. Now that `users` exists for real, this is unblocked, but
+  wasn't asked for in this session — don't build it speculatively.
 - `feature/editor-mvp` — explicitly deprioritized ("skip the editor for
   now, as it's an extra feature") in favor of the no-login frontend.
   Fabric.js/Konva.js canvas, not started at all.
-- `feature/drive-upload` — not started, depends on auth existing first.
-  Per this session's Q&A: it would attach to the already-produced PDF
-  bytes from `reinsert_and_export` in `translate.py`, as an additional
-  output destination alongside/instead of the Blob upload — it wouldn't
-  touch extraction/classification/translation at all.
+- Whether to actually gate any part of the app behind sign-in (currently
+  nothing is) is an open product decision, not yet made.
 
 ## 7. Known issues / TODOs
 
+- **Google sign-in's redirect-URI registration is not independently
+  re-verified as working end-to-end** — see §6's env-var entry for the
+  full status (Vercel env vars ARE confirmed correctly provisioned;
+  the Google Cloud Console side is reported-fixed by the user but not
+  re-tested via browser since). Re-run the browser sign-in test (or ask
+  the user to confirm) before relying on this working in any of the
+  three environments.
+- **Refresh-token encryption-at-rest (CLAUDE.md's requirement) is not yet
+  implemented** — deliberately, because no refresh token exists yet
+  (current scope is identity-only, no `drive.file`/offline access
+  requested). Must be added as part of `feature/drive-upload`, not
+  bolted on after the column already has real plaintext tokens in it.
 - **Redaction still clips a tiny sliver of diagram ink when a caption's
   text bbox and the diagram have zero gap between them in the source
   layout** — found on `sample_plan_2.pdf`'s "D1-A. 1 pce." caption
@@ -591,4 +711,11 @@ git fetch origin
 git checkout dev
 git merge --ff-only origin/dev
 git checkout -b feature/<name>
+
+# Prisma migrations (auto-loads prisma7.config.ts -> DIRECT_URL; despite
+# the filename, no --config flag is needed, Prisma finds it on its own):
+npx prisma migrate dev --name <description>   # create + apply a migration
+npx prisma generate                            # regenerate app/generated/prisma
+                                                # without a migration (e.g. after
+                                                # a manual schema edit + npx prisma db push)
 ```

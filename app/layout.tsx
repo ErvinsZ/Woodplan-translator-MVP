@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { Space_Grotesk, IBM_Plex_Mono } from "next/font/google";
+import { AuthStatus } from "./components/AuthStatus";
+import { Providers } from "./providers";
 import "./globals.css";
 
 const spaceGrotesk = Space_Grotesk({
@@ -25,7 +27,14 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${spaceGrotesk.variable} ${plexMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        <Providers>
+          <div className="flex justify-end px-6 py-4">
+            <AuthStatus />
+          </div>
+          {children}
+        </Providers>
+      </body>
     </html>
   );
 }
