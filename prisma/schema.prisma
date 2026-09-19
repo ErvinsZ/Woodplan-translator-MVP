@@ -11,3 +11,21 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+// Dynamic (Gemini-generated) translation memory cache. Keyed on stripped,
+// lowercased source text -- distinct from api/glossary.py's hand-curated
+// GLOSSARY dict, which stays a checked-in Python file and preserves raw
+// whitespace as a load-bearing match key. See PROJECT_STATE.md.
+model GlossaryTerm {
+  id              Int      @id @default(autoincrement())
+  sourceText      String   @map("source_text")
+  sourceTextLower String   @map("source_text_lower")
+  targetLang      String   @map("target_lang")
+  translation     String
+  source          String   @default("gemini")
+  model           String?
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@unique([sourceTextLower, targetLang])
+  @@map("glossary_terms")
+}

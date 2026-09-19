@@ -5,6 +5,14 @@ import { useCallback, useRef, useState } from "react";
 
 type Status = "idle" | "uploading" | "translating" | "done" | "error";
 
+type Lang = "de" | "es" | "fr";
+
+const LANGUAGES: { code: Lang; label: string; adjective: string }[] = [
+  { code: "de", label: "DE", adjective: "German" },
+  { code: "es", label: "ES", adjective: "Spanish" },
+  { code: "fr", label: "FR", adjective: "French" },
+];
+
 function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -12,6 +20,7 @@ function formatBytes(bytes: number) {
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
+  const [lang, setLang] = useState<Lang>("de");
   const [status, setStatus] = useState<Status>("idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
@@ -53,7 +62,7 @@ export default function Home() {
       });
 
       setStatus("translating");
-      const res = await fetch("/api/translate?lang=de", {
+      const res = await fetch(`/api/translate?lang=${lang}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ blob_url: uploaded.url, filename: file.name }),
@@ -71,7 +80,9 @@ export default function Home() {
         err instanceof Error ? err.message : "Translation failed. Please try again."
       );
     }
-  }, [file]);
+  }, [file, lang]);
+
+  const selectedLanguage = LANGUAGES.find((l) => l.code === lang)!;
 
   return (
     <div className="flex flex-1 items-center justify-center px-6 py-16">
@@ -79,7 +90,7 @@ export default function Home() {
         {/* title block, styled after the plan's own corner stamp */}
         <div className="flex items-center justify-between border-b border-line-strong px-5 py-3 font-mono text-[11px] uppercase tracking-[0.14em] text-muted">
           <span>Woodplan Translator</span>
-          <span className="text-accent">EN &rarr; DE</span>
+          <span className="text-accent">EN &rarr; {selectedLanguage.label}</span>
         </div>
 
         <div className="px-6 py-8 sm:px-9 sm:py-10">
@@ -91,7 +102,28 @@ export default function Home() {
             exactly where they are on the page &mdash; only the words move.
           </p>
 
-          <div className="mt-8">
+          <div className="mt-6 flex gap-2" role="radiogroup" aria-label="Target language">
+            {LANGUAGES.map(({ code, label, adjective }) => (
+              <button
+                key={code}
+                type="button"
+                role="radio"
+                aria-checked={lang === code}
+                disabled={status === "uploading" || status === "translating"}
+                onClick={() => setLang(code)}
+                title={adjective}
+                className={`border px-3 py-1.5 font-mono text-xs uppercase tracking-[0.1em] transition-colors disabled:opacity-60 ${
+                  lang === code
+                    ? "border-blueprint bg-blueprint text-paper"
+                    : "border-line-strong text-muted hover:border-blueprint hover:text-foreground"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div className="mt-6">
             {!file && (
               <label
                 onDragOver={(e) => {
@@ -159,7 +191,7 @@ export default function Home() {
                       ? "Uploading…"
                       : status === "translating"
                         ? "Translating…"
-                        : "Translate to German"}
+                        : `Translate to ${selectedLanguage.adjective}`}
                   </button>
                 )}
 
@@ -199,7 +231,7 @@ export default function Home() {
         </div>
 
         <div className="border-t border-line-strong px-5 py-2.5 font-mono text-[10px] uppercase tracking-[0.14em] text-muted">
-          German only &middot; glossary-based &middot; unmatched text flagged, not guessed
+          Glossary + AI fallback &middot; unresolved text flagged, not guessed
         </div>
       </div>
     </div>

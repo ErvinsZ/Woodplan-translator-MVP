@@ -21,6 +21,15 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
     `rotation_angle` extract.py reads back out (verified for 0, ±45, ±90,
     and non-axis angles) — one code path handles every angle correctly,
     including the axis-aligned cases the old `rotate=` int also covered.
+  - `refit_span`'s shrink loop only ever assigned `used_size` inside the
+    "found a size that fits" branch, so a translation that STILL didn't
+    fit at the shrink floor rendered at the full, un-shrunk original font
+    size — the worst-case rendering, and the opposite of CLAUDE.md's
+    "shrink to a floor before flagging" spec. Silent (no error, no test
+    caught it) until French/Spanish LLM-fallback translations — which run
+    longer than the hand-curated German glossary ever did — visibly ran a
+    heading off the page edge. Fixed via a `while/else`: if the loop never
+    breaks (never finds a fit), render at the floor size, not the original.
 """
 
 import base64
@@ -90,6 +99,12 @@ def refit_span(text_box):
                 used_size = shrink
                 fits = True
                 break
+        else:
+            # Never fit even at the floor -- render at the floor size as
+            # the best available effort rather than leaving used_size at
+            # the full original size, which would overflow even more.
+            # Still flagged via needs_review below either way.
+            used_size = floor
 
     pipeline["used_font_size"] = round(used_size, 2)
     pipeline["overflow"] = not fits

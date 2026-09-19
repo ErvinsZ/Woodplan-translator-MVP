@@ -227,8 +227,96 @@ translators that don't understand dimensioned technical drawings.
 
 ## 6. What's in progress
 
-Nothing mid-edit. `dev` is in a clean, fully-committed, working state as of
-the last session. The natural next slice (per CLAUDE.md's suggested branch
+**Dynamic Gemini-backed translation + Spanish/French support** — built and
+verified this session, **not yet committed** (working tree on `dev`, no
+feature branch cut yet — ask before committing/branching). Plan lives at
+`~/.claude/plans/wiggly-imagining-stream.md`. Adds a 4th classify/translate
+tier: spans the static glossary misses now check a Postgres-backed dynamic
+cache (`glossary_terms` table) first, then fall back to a Gemini API call
+with full-sentence context (to resolve homographs like "board" the lumber
+vs. "board" a ship — a naive per-word fallback would get these wrong).
+Successful Gemini translations are saved back to the cache, so repeat
+occurrences (within a document or across future documents/sellers) hit the
+cache instead of calling the API again.
+
+- **New Postgres database provisioned**: Neon, created directly at
+  neon.tech (NOT via `vercel integration add neon`) — deliberately, because
+  Vercel's marketplace-managed billing wrapper reportedly has no hard spend
+  cap once free-tier usage is exceeded, whereas Neon's own direct free tier
+  is hard-capped (100 CU-hours/month, 0.5GB) with no card on file. `DATABASE_URL`
+  (pooled, hostname has `-pooler`) and `DIRECT_URL` (direct) are real now,
+  in both `.env.local` and all three Vercel project environments — no
+  longer placeholders. Note: Neon's pooling is hostname-based
+  (`-pooler` suffix), not port-based like Supabase's 6543/5432 split this
+  file previously described — same pooled-for-runtime/direct-for-migrations
+  concept, different URL shape.
+- **New Prisma model**: `GlossaryTerm` (`@@map("glossary_terms")`) in
+  `prisma/schema.prisma`, migrated via `prisma migrate dev` against
+  `DIRECT_URL` (migration `20260919102204_add_glossary_terms`). Keyed on
+  `(source_text_lower, target_lang)` unique constraint — stripped +
+  lowercased text, deliberately different from the static `GLOSSARY`
+  dict's raw-whitespace-preserving keys (see `api/translation_cache.py`'s
+  docstring for why). **No Prisma Python client exists** — runtime
+  reads/writes from `api/*.py` go through `psycopg` directly
+  (`api/db.py`), not Prisma; Prisma only owns schema/migrations here.
+- **New files**: `api/db.py` (psycopg connection helper),
+  `api/translation_cache.py` (cache lookup/save, fails soft on any DB
+  error), `api/gemini_translate.py` (Gemini client wrapper: system prompt
+  built from the static glossary for consistency/homograph guidance,
+  chunking + in-process pacing to respect free-tier rate limits, retry
+  with backoff on 429/5xx, never raises past a single chunk's failure).
+- **Changed**: `api/classify_translate.py` gets `_apply_llm_fallback`,
+  run once per document (not per-page — dedup needs cross-page
+  visibility) after the existing 3 tiers; `api/translate.py`'s
+  `DEFAULT_TARGET_LANG` comment updated (still `"de"` as default, but
+  `es`/`fr` are now real, just with less static glossary coverage
+  initially); `app/page.tsx` gets a DE/ES/FR language toggle (was
+  hardcoded to `?lang=de`).
+- **Model note**: `gemini-2.5-flash-lite` (the model originally planned,
+  for its free-tier limits) returned `404 NOT_FOUND` on `generate_content`
+  for this project's API key — "no longer available to new users," despite
+  still appearing in the `/models` listing. Don't reintroduce it. Live
+  model list confirmed the actual available lite model + exact ID via
+  `GET /v1beta/models` (don't trust training-data model names or search
+  results for this — Google changes free-tier model availability without
+  much notice): **`gemini-3.1-flash-lite`**, confirmed against this
+  account's real AI Studio dashboard, 2026-09-19: 15 req/min, 500 req/day,
+  250k tokens/min. That's what `gemini_translate.py`'s `MODEL` constant
+  and throttling constants (`_MIN_SECONDS_BETWEEN_CALLS`,
+  `_MAX_TOKENS_PER_CHUNK`) are tuned for now.
+- **Verified against `reference/sample_plan.pdf`, all 3 languages, with
+  real Gemini calls** (not mocked): German unchanged from the
+  pre-existing baseline (348 glossary_match, 165 code, 16 mixed — the 4
+  previously-`unmatched` spans now correctly `llm_match` via Gemini,
+  coherent translation). Spanish and French (zero static glossary
+  coverage) both went from 0 static coverage to 368/533 spans correctly
+  `llm_match` in a single Gemini call each. Postgres cache verified two
+  ways: direct save/lookup against the real Neon DB, and a full second
+  pipeline run with `gemini_translate.translate_batch` monkey-patched to
+  raise if called at all — it wasn't, confirming cache hits actually skip
+  the API rather than just returning the same answer coincidentally.
+- **Bug found and fixed via this testing**: `reinsert.py`'s `refit_span`
+  only updated `used_font_size` inside the "found a fit" branch of its
+  shrink loop, so a translation that never fit even at the shrink floor
+  silently rendered at the full, un-shrunk original size — worse than
+  the floor size, and the opposite of CLAUDE.md's "shrink to a floor
+  before flagging" spec. Pre-existing, but invisible until Gemini-fallback
+  French/Spanish text (longer than the length-conscious hand-curated
+  German glossary) visibly ran a page-1 heading off the right edge in a
+  rendered PNG check. Fixed with a `while/else`: render at the floor size
+  when the loop never finds a fit. Re-verified by re-rendering — heading
+  now fits; `needs_review`/`overflow` flags still correctly fire. See
+  `reinsert.py`'s own docstring for the full note.
+- **Real infra provisioned this session** (previously placeholders):
+  Neon Postgres (created directly at neon.tech, NOT via
+  `vercel integration add neon` — that marketplace billing path reportedly
+  has no hard spend cap once free tier is exceeded, whereas Neon's own
+  direct free tier is hard-capped with no card on file). `DATABASE_URL`
+  (pooled, `-pooler` hostname) / `DIRECT_URL` (direct) are real now, in
+  `.env.local` and all three Vercel environments. `GEMINI_API_KEY` (Google
+  AI Studio, free tier) likewise real in both places.
+
+The natural next slice after this lands (per CLAUDE.md's suggested branch
 order, adjusted for what's already built) is one of:
 - `feature/auth` — NextAuth/Auth.js + Google OAuth, `drive.file` scope only.
   `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/`NEXTAUTH_URL`

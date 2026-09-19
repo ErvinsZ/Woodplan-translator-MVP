@@ -22,6 +22,17 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
     one PyMuPDF text object, e.g. "S2 screws, 16 pc." — are tokenized
     rather than translated or skipped wholesale, so codes pass through
     exactly and words translate independently within the same span.
+
+A 4th tier runs after the three above, at the whole-document level (not
+per-page, since it needs cross-page dedup): every span still classified
+"unmatched" is deduped by stripped+lowercased text, checked against the
+dynamic translation-memory cache (api/translation_cache.py), and whatever
+still misses is sent to Gemini (api/gemini_translate.py) with full-
+sentence context -- never per-word, since word-by-word translation is
+exactly what breaks on homographs like "board" (lumber vs. "board a
+ship"). Anything the LLM tier can't resolve (API/DB unavailable, a chunk
+failing after retries) keeps today's exact "unmatched"/needs_review=True
+behavior -- this tier only ever adds coverage, never removes it.
 """
 
 import json
@@ -37,6 +48,8 @@ from http.server import BaseHTTPRequestHandler
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from glossary import GLOSSARY
+import gemini_translate
+import translation_cache
 
 # Numbers, dimension strings ("3'-1 3/8\""), and part codes (D1, S2) —
 # never translated, regardless of glossary contents.
@@ -66,6 +79,14 @@ def _glossary_lookup(key, target_lang):
     return GLOSSARY[canonical].get(target_lang)
 
 
+def _reapply_whitespace(original_text, translation):
+    """Reapplies original_text's leading/trailing whitespace around a
+    translation produced from its stripped form."""
+    leading_ws = original_text[: len(original_text) - len(original_text.lstrip())]
+    trailing_ws = original_text[len(original_text.rstrip()):]
+    return leading_ws + translation + trailing_ws
+
+
 def _match_whole_span(text, target_lang):
     """Tier 1: try the whole span as one glossary phrase.
 
@@ -81,9 +102,7 @@ def _match_whole_span(text, target_lang):
     if stripped != text:
         stripped_translation = _glossary_lookup(stripped, target_lang)
         if stripped_translation is not None:
-            leading_ws = text[: len(text) - len(text.lstrip())]
-            trailing_ws = text[len(text.rstrip()):]
-            return leading_ws + stripped_translation + trailing_ws
+            return _reapply_whitespace(text, stripped_translation)
 
     return None
 
@@ -150,10 +169,73 @@ def classify_translate_page(page, target_lang):
     return page
 
 
+def _apply_llm_fallback(document, target_lang):
+    """Tier 4: whole-document Gemini fallback for spans tiers 1-3 missed.
+
+    Runs at the document level (not per-page) because deduping needs
+    cross-page visibility -- the same sentence often repeats across pages
+    of a plan. Any failure here (missing API key, DB down, Gemini down)
+    is caught and simply leaves the affected spans in their existing
+    "unmatched"/needs_review=True state -- this tier only adds coverage.
+    """
+    unmatched_boxes = [
+        text_box
+        for page in document["pages"]
+        for text_box in page["text_boxes"]
+        if text_box["pipeline"]["classification"] == "unmatched"
+    ]
+    if not unmatched_boxes:
+        return
+
+    # Dedup by stripped+lowercased text -- both the cache and Gemini
+    # operate on stripped text; original whitespace is reapplied per-span
+    # below via the same mechanic _match_whole_span uses.
+    by_key = {}
+    for text_box in unmatched_boxes:
+        stripped = text_box["text"].strip()
+        if stripped:
+            by_key.setdefault(stripped.lower(), stripped)
+
+    if not by_key:
+        return
+
+    translations = translation_cache.lookup_many(by_key.values(), target_lang)
+
+    misses = {key: stripped for key, stripped in by_key.items() if key not in translations}
+    if misses:
+        try:
+            keys = list(misses.keys())
+            pairs = [(i, misses[key]) for i, key in enumerate(keys)]
+            gemini_results = gemini_translate.translate_batch(pairs, target_lang)
+            new_entries = [
+                (misses[keys[item_id]], translation)
+                for item_id, translation in gemini_results.items()
+            ]
+            translation_cache.save_many(new_entries, target_lang, gemini_translate.MODEL)
+            for item_id, translation in gemini_results.items():
+                translations[keys[item_id]] = translation
+        except Exception as exc:
+            print(f"classify_translate: LLM fallback failed ({exc!r})", file=sys.stderr)
+
+    if not translations:
+        return
+
+    for text_box in unmatched_boxes:
+        text = text_box["text"]
+        stripped = text.strip()
+        translation = translations.get(stripped.lower()) if stripped else None
+        if translation is None:
+            continue
+        text_box["pipeline"]["translated_text"] = _reapply_whitespace(text, translation)
+        text_box["pipeline"]["classification"] = "llm_match"
+        text_box["pipeline"]["needs_review"] = False
+
+
 def classify_translate_document(document, target_lang):
     """Fills in `pipeline` for every text box across an extract.py document dict."""
     for page in document["pages"]:
         classify_translate_page(page, target_lang)
+    _apply_llm_fallback(document, target_lang)
     return document
 
 
