@@ -203,15 +203,27 @@ GLOSSARY = {
     # Split across 3 lines, two sentences with the boundary falling
     # mid-line; German word choice shifted slightly from the literal
     # English breakpoints so no word (e.g. "Werkzeug") is broken across
-    # the line boundary.
+    # the line boundary. The 2nd/3rd line split point ("Material" moved
+    # onto line 2 rather than staying on line 3, unlike the literal
+    # English breakpoint) was chosen by checking the rendered width of
+    # each candidate split against each line's real bbox from
+    # reference/sample_plan.pdf -- the literal-English split put "Material
+    # außerhalb der Reichweite von Kindern aufbewahren." (60 chars) alone
+    # on line 3's much narrower box (sized for the shorter English
+    # "materials out of reach of children."), needing the font shrunk to
+    # ~50% to fit at all and visibly overlapping the page's dashed layout
+    # guide line to its right. This split balances both lines to need
+    # only ~67-72% of the original size, both well inside a single
+    # consistent-looking shrink instead of one line at full size and the
+    # next drastically smaller.
     "Work in a well-ventilated area when ": {
         "de": "In einem gut belüfteten Bereich arbeiten, wenn ",
     },
     "using paint or stain. Keep tools and ": {
-        "de": "Farbe oder Beize verwendet wird. Werkzeug und ",
+        "de": "Farbe oder Beize verwendet wird. Werkzeug und Material ",
     },
     "materials out of reach of children.": {
-        "de": "Material außerhalb der Reichweite von Kindern aufbewahren.",
+        "de": "außerhalb der Reichweite von Kindern aufbewahren.",
     },
     "Tools:": {
         "de": "Werkzeuge:",

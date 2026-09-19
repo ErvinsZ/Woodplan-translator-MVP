@@ -1,6 +1,12 @@
 # Project State
 
-Last updated: 2026-09-19, after merging dynamic Gemini translation + Spanish/French support (PR #4).
+Last updated: 2026-09-19, after a second pass fixing `reinsert.py`
+rendering bugs (redaction border artifact over diagrams; hardcoded font;
+overflow bleed/wrap-into-diagram, resolved via a deep-shrink-first
+fallback) plus one `glossary.py` content rebalance, verified against real
+broken-output repros the user generated locally — not yet on a merged
+branch, see §6. Previous entries: after merging dynamic Gemini translation
++ Spanish/French support (PR #4).
 See `CLAUDE.md` for the original plan/spec; this file tracks actual current state,
 which has diverged from and extended that plan in places noted below.
 
@@ -307,6 +313,20 @@ translators that don't understand dimensioned technical drawings.
   returns Next.js's HTML 404 page, which breaks frontend `res.json()` calls
   with `"Unexpected token '<'"`. This is the single most likely thing to trip
   up a fresh session — see §7.
+- **PyMuPDF's `apply_redactions()` default `images=2` ("blank out
+  overlapping image parts") is not safe to leave at its default in this
+  pipeline.** Found by pixel-diffing rendered output against
+  `reference/sample_plan_2.pdf`: any text span whose redaction rect merely
+  *touched* a diagram's raster image bounding box (not necessarily over
+  visible diagram ink) got a visible boundary line baked permanently onto
+  the page. Isolated by toggling `apply_redactions`'s `images=`/`graphics=`
+  params independently against real sample pages and diffing pixel values
+  at the artifact's exact location — `images=0`/`images=1` never showed
+  it, `images=2` always did, `cross_out` on `add_redact_annot` made no
+  difference either way. `reinsert.py` now always passes `images=0`: this
+  pipeline's own rule is that diagrams are never touched, so there's no
+  case where `images=2`'s blanking behavior should have been wanted here
+  in the first place.
 
 ## 5. What's done
 
@@ -340,12 +360,74 @@ translators that don't understand dimensioned technical drawings.
 - Four PRs merged to `dev`: #1 (extraction), #2 (reinsertion/export +
   glossary expansion), #3 (frontend), #4 (dynamic Gemini translation +
   Spanish/French + the native-extension fix in §4).
+- Fixed several visible rendering bugs in `reinsert.py`/`glossary.py`,
+  all root-caused against real output from `reference/sample_plan.pdf`,
+  `reference/sample_plan_2.pdf`, and broken-output repros the user
+  generated locally (`reference/sample_plan_broken_{de,es}.pdf`,
+  `reference/sample_plan_2_broken.pdf` — not yet on a merged branch, see
+  §6):
+  1. A rectangular border baked onto the page wherever a reinserted
+     span's redaction rect touched a diagram's raster image, root-caused
+     to `apply_redactions()`'s default `images=2`; fixed by passing
+     `images=0` (redaction must never touch image content here at all,
+     per this module's own "never touch the diagram" rule).
+  2. Translated text hardcoded to Helvetica regardless of the span's real
+     font; fixed by mapping the extracted font name to the closest
+     base-14 family/weight (`_base14_font`).
+  3. Genuinely-overflowing spans (still too long even at the normal
+     75-80% shrink floor) rendered unclipped, bleeding sideways across
+     their column border into neighboring cells or wrapping down into
+     whatever sat directly below (often a diagram, not blank paper).
+     Fixed with a 3-tier fallback in `_insert_span`, tried in order: (a)
+     `_deep_shrink_fit` — shrink further, well past the normal floor
+     (down to `_DEEP_SHRINK_FLOOR_RATIO`/`_DEEP_SHRINK_MIN_SIZE`), to see
+     if the whole translation fits back on its ORIGINAL single line; (b)
+     a bbox-width-capped, sibling-line-aware `insert_textbox` wrap for
+     text tier (a) can't rescue; (c) the original single-unclipped-line
+     render as a last resort. Scanning every page of the real sample PDF
+     found 12 real German overflow cases — tier (a) alone now resolves
+     all 12, so tiers (b)/(c) are no longer hit by any case found in real
+     data so far (kept as fallbacks for content tier (a) genuinely can't
+     fit, e.g. a whole extra sentence's worth).
+  4. One static glossary entry pair (`"using paint or stain. Keep tools
+     and "` / `"materials out of reach of children."`) had the German
+     translation split very unevenly between the two original line-spans
+     (almost everything on line 2's much narrower box), which even
+     tier-(a) shrink alone rendered inconsistently-sized between the two
+     lines. Rebalanced the word split between the two glossary entries
+     (moved "Material" onto line 1) using each line's real bbox width
+     from the sample PDF — both lines now need a similar, moderate
+     shrink instead of one full-size and one drastically tiny.
+  All four originally-reported real cases (D1-A/D1-B captions overlapping
+  the diagram in `sample_plan_2`; the German safety-notice text crossing
+  the dashed layout-guide line; the Spanish title bleeding into the
+  copyright column; "Cerrada" splitting mid-word) are now confirmed fixed
+  by re-rendering the exact same real spans through the current code.
 
 ## 6. What's in progress
 
-Nothing mid-edit. `dev` is clean and fully committed as of the last
-session. The natural next slice (per CLAUDE.md's suggested branch order,
-adjusted for what's already built) is one of:
+All `reinsert.py`/`glossary.py` fixes from §5 are complete and verified
+against real output, on **`feature/reinsert-render-fixes`** (branched off
+`dev`, not yet committed/pushed/PR'd — the branch exists but nothing has
+been committed to it yet; carries the same working-tree changes `dev` had
+uncommitted before the branch was created). Before committing: this is a
+bug fix to already-merged code rather than new feature work, so a direct
+squash-ish single commit is probably right per the usual PR convention,
+still opened as a normal PR into `dev` per CLAUDE.md's workflow.
+`reference/sample_plan_2.pdf` is also untracked (a second real test
+fixture, Calibri/Verdana-based, added to reproduce the border-artifact
+bug) along with three more real broken-output repros the user generated
+locally while testing this fix in progress —
+`reference/sample_plan_2_broken.pdf`,
+`reference/sample_plan_broken_de.pdf`,
+`reference/sample_plan_broken_es.pdf` — all four worth committing
+alongside if kept as permanent reference/regression fixtures (they're
+genuinely useful: every real bug found and fixed this session was
+root-caused directly against one of them, not guessed from screenshots
+alone).
+
+Otherwise nothing else mid-edit. The natural next slice (per CLAUDE.md's
+suggested branch order, adjusted for what's already built) is one of:
 - `feature/auth` — NextAuth/Auth.js + Google OAuth, `drive.file` scope only.
   `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/`NEXTAUTH_URL`
   are already in `.env.local` but are placeholder/local-only — not yet
@@ -366,6 +448,29 @@ adjusted for what's already built) is one of:
 
 ## 7. Known issues / TODOs
 
+- **Redaction still clips a tiny sliver of diagram ink when a caption's
+  text bbox and the diagram have zero gap between them in the source
+  layout** — found on `sample_plan_2.pdf`'s "D1-A. 1 pce." caption
+  (visible as a faint ~1-2px notch cut into the top of the circle arc
+  directly below the text, only visible zoomed in). Root-caused by
+  checking real pixel data: the drawing's topmost ink starts at the exact
+  same y-coordinate the text's bbox ends at (confirmed via `get_text`'s
+  raw span data — that bbox edge is `origin.y + descender*size`, i.e. the
+  font's generic descender metric, not a measurement of real glyph ink;
+  "1 pc."'s lowercase "p" descender genuinely reaches close to that same
+  boundary too). This is a different failure mode from the earlier
+  `images=2` border bug (§5) — `images=0` doesn't help here, since the
+  redaction's white FILL rectangle itself (not image blanking) is what
+  overlaps the diagram. Not fixable by adjusting a parameter: erasing all
+  the original English text requires covering the font-metric bbox, and
+  when that bbox and the diagram genuinely touch in the source PDF with
+  no buffer, some overlap is unavoidable with a bbox-based redaction
+  rect. A real fix would need ink-based redaction (rasterize the region,
+  diff against real glyph pixels instead of trusting the font-metric
+  bbox, erase only actual text ink) — a meaningfully bigger change.
+  **Explicitly deferred per user request (2026-09-19)** — logged, not
+  attempted. Revisit if it turns out to affect more than this one corner
+  case (captions sitting flush against a diagram edge with zero gap).
 - **No automated tests exist.** CLAUDE.md explicitly calls for unit tests on
   the classify/translate tokenizer and the rotation-aware overflow check —
   the two places silent bugs were already found once. Worth doing before
@@ -377,6 +482,39 @@ adjusted for what's already built) is one of:
   font ascent/descent data not currently captured. Every diagonal span found
   so far is an untranslated numeric code, so this hasn't mattered in
   practice — but it's untested against a real translated diagonal span.
+- **The wrap-box and single-line-bleed fallback tiers in `_insert_span`
+  are no longer hit by any real case found so far** (see §5 point 3) —
+  `_deep_shrink_fit` alone resolved every real overflow found across all
+  15 pages of `sample_plan.pdf` in German, plus the specific Spanish
+  cases from real broken output. They're kept as fallbacks for text tier
+  1 genuinely can't rescue (e.g. a whole extra sentence's worth on a tiny
+  label), not because a real case currently needs them. If one ever does:
+  extract.py doesn't capture diagram/image bboxes today, and a quick
+  check found sample data's diagrams are one page-covering raster image
+  (not per-shape vector paths, confirmed via `page.get_drawings()`
+  returning empty), so there's no simple per-diagram collision boundary
+  available even if this were revisited.
+- **`translation_cache.py`'s `save_many` is first-writer-wins
+  (`ON CONFLICT DO NOTHING`), by explicit v1 design** (see its own
+  docstring) — once a Gemini translation is cached for a
+  `(source_text_lower, target_lang)` pair, every later run reuses that
+  exact cached string forever, even after a prompt/glossary change that
+  would have produced a better translation. This is the likely
+  explanation if local testing ever shows a translation that doesn't
+  reflect a recent glossary/prompt edit for a phrase NOT in the static
+  glossary (a static-glossary edit itself takes effect immediately next
+  run regardless of this cache — `classify_and_translate` checks the
+  static `GLOSSARY` dict first, tier 4/Postgres only runs on spans still
+  `unmatched` after that). No admin/review UI exists yet to hand-edit or
+  clear a stale row (see the existing bullet on this below) — a manual
+  `DELETE FROM glossary_terms WHERE ...` against Neon is the only way
+  today. Checked directly against the real DB while investigating a
+  "local dev glossary seems stale" report: only 4 German rows exist
+  total (for a page-15 span unrelated to what was reported), so this
+  wasn't the actual cause that time — the far more likely cause for a
+  genuinely-edited `glossary.py` entry not showing up locally is the
+  already-documented `vercel dev` Python build-caching gotcha (clear
+  `.vercel/cache`/`api/__pycache__` and restart `npm run dev:full`).
 - **No image recompression on export**, despite CLAUDE.md flagging it as "a
   cheap, separate win worth doing regardless." Output PDF is currently ~9.6%
   *larger* than input (redaction/reinsertion adds content-stream overhead
