@@ -617,6 +617,36 @@ translators that don't understand dimensioned technical drawings.
   - `ENCRYPTION_KEY` (fresh 32-byte value, generated this session via
     `openssl rand -base64 32`) added to `.env.local` and all three Vercel
     environments (shared value, same pattern as `NEXTAUTH_SECRET`).
+- Fixed a real, user-reported font-size-consistency bug in
+  `reinsert.py`: translated text within what should be one uniform
+  vertical list, or one multi-line heading, rendered at wildly
+  inconsistent sizes (some tiny, some full-size, no visible pattern).
+  Root-caused against real extracted span data before touching any code
+  (user explicitly asked for that order): `_available_length` measured
+  a span's "room to grow" as its own original bbox width — exactly as
+  wide as the ENGLISH word happened to render, not a real layout
+  boundary. A Tools checklist where every original item is genuinely
+  20pt confirmed this exactly: "Jig Saw" (short original, ~72pt of
+  inherited slack) -> "Scie sauteuse" crushed to 12.6pt, while "Safety
+  goggles and gloves" (long original, ~227pt of slack) stayed full
+  20pt, purely because the English words differed in length. Fixed by
+  loosening the constraint (real page margin, capped to a bounded
+  multiple of the original width) for spans with no real same-line
+  neighbor, added as new logic in `_available_length`
+  (`_has_same_line_neighbor` is the safety gate) — see `reinsert.py`'s
+  own module docstring for the full writeup, including the one blind
+  spot (extract.py doesn't capture diagram image bboxes, so "no text
+  neighbor" can't fully rule out a diagram occupying the loosened
+  space — bounded via a width multiplier rather than trusted all the
+  way to the page edge). Verified against real data, not just theory:
+  the exact reported Tools-list case now renders fully uniform at 20pt
+  with zero shrink in both Spanish and French; a full 15-page German
+  re-run of the whole pipeline shows no regression on dimension-heavy,
+  diagram-adjacent pages (rendered to PNG and visually checked); 218
+  real spans with a genuine same-line neighbor confirmed to get the
+  exact prior tight behavior, unchanged.
+  - Not yet committed — sitting on `dev`'s working tree as of this
+    entry, user should review before it's committed/pushed.
 
 ## 6. What's in progress
 
