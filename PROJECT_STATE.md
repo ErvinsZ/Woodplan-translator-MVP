@@ -1,12 +1,16 @@
 # Project State
 
-Last updated: 2026-09-20, after `dev` was merged to `main` and deployed
-to a real Production environment, Vercel's SSO deployment protection
-(which was blocking Production entirely) was resolved, and Google
-sign-in was confirmed working end-to-end on Production, `dev` Preview,
-and `localhost:3000` — see §5/§6/§7. User/Google-auth work is fully
-closed out as of this entry.
-Previous entries: `feature/google-auth` merged to `dev` (PR #6); before
+Last updated: 2026-09-20, after implementing Google Drive autosave
+(`feature/drive-upload`, branched off `dev` — schema + backend + frontend
+done, build/lint clean, NOT yet manually tested end-to-end or
+committed) — see §5/§6/§7. This needs three manual Google Cloud Console
+steps from the user before it can work at all, none done yet as of this
+entry — see §6.
+Previous entries: `dev` merged to `main`, deployed to a real Production
+environment, Vercel's SSO deployment protection (which was blocking
+Production entirely) resolved, Google sign-in confirmed working
+end-to-end on Production/`dev` Preview/`localhost:3000`.
+Before that: `feature/google-auth` merged to `dev` (PR #6); before
 that, a Vercel build failure was found + fixed post-merge (missing
 Prisma client generation) and a broken `NEXTAUTH_URL` value on the `dev`
 Preview deployment was found + fixed; before that, adding user database
@@ -152,10 +156,53 @@ translators that don't understand dimensioned technical drawings.
   `@auth/prisma-adapter`, NOT the older/deprecated
   `@next-auth/prisma-adapter`), Google provider, **database** session
   strategy (not JWT) so sessions persist in Postgres across stateless
-  function invocations. `session` callback copies `user.id` onto
-  `session.user.id` (typed via `types/next-auth.d.ts`).
+  function invocations. `session` callback copies `user.id` +
+  `driveAutosaveEnabled` onto `session.user` (typed via
+  `types/next-auth.d.ts`). Google provider requests
+  `drive.file`/`access_type=offline`/`prompt=consent` scope UPFRONT at
+  every sign-in, not as a separate incremental-consent flow -- a
+  deliberate simplicity trade-off (every user sees the Drive permission
+  request, and sees Google's consent screen on every sign-in, not just
+  the first) in exchange for reusing NextAuth's existing account-linking
+  instead of a second OAuth callback route. Refresh token is encrypted
+  (`lib/crypto.ts`) via TWO mechanisms, both needed: (1) a `linkAccount`
+  wrapper around the adapter, which only fires for a brand-new account;
+  (2) an `events.signIn` handler, which fires on EVERY sign-in (new or
+  repeat) with the raw OAuth `account` object regardless of what the
+  adapter did with it. (2) exists because
+  `node_modules/next-auth/core/lib/callback-handler.js` was read
+  directly and confirmed: for an ALREADY-linked account, NextAuth v4
+  skips `linkAccount` entirely and just creates a session -- any fresh
+  refresh_token from that sign-in's re-consent would otherwise be
+  silently discarded, meaning a user who signed in before this feature
+  existed would never actually get a Drive token stored just by signing
+  in again. Confirmed via source, not assumed.
 - `app/api/auth/[...nextauth]/route.ts` — the NextAuth App Router handler
   (`NextAuth(authOptions)`, exported as both `GET`/`POST`).
+- `lib/crypto.ts` — AES-256-GCM `encrypt`/`decrypt`, keyed by
+  `ENCRYPTION_KEY` (32 random bytes, base64 in env, shared across all
+  three Vercel environments like `NEXTAUTH_SECRET`). Node's built-in
+  `crypto`, no new dependency. Used specifically for the Drive
+  `refresh_token` at rest, per CLAUDE.md's requirement.
+- `lib/drive.ts` — hand-rolled Drive v3 REST calls (no `googleapis`
+  client, matching `api/blob.py`'s/`api/gemini_translate.py`'s existing
+  pattern). `saveTranslationToDrive(userId, blobUrl, filename)`: decrypts
+  the user's stored refresh_token, exchanges it for a fresh access_token
+  (always refreshes on use rather than caching one -- simple and correct
+  for a stateless serverless function), finds-or-creates the user's Drive
+  folder, fetches the translated PDF from its Blob URL, uploads it.
+  `findOrCreateFolder` verifies a stored `driveFolderId` still resolves
+  (not trashed/deleted) before reusing it -- a Drive file ID survives the
+  user renaming the folder, only a delete/trash invalidates it, so this
+  directly answers "what if the user renames the folder."
+- `app/api/drive/toggle/route.ts` (POST) — flips `User.driveAutosaveEnabled`
+  for the signed-in user. No re-consent needed; the scope was already
+  granted at sign-in (see `lib/auth.ts` below).
+- `app/api/drive/save/route.ts` (POST) — takes `{blob_url, filename}`,
+  requires a session with `driveAutosaveEnabled` true, calls
+  `saveTranslationToDrive`. Called by the frontend right after a
+  successful `/api/translate`, purely additive -- never blocks or alters
+  the existing download-button flow.
 
 **Reference/test fixtures (not app code):**
 - `reference/sample_plan.pdf` — real 15-page Etsy plan, the only test input
@@ -217,6 +264,19 @@ translators that don't understand dimensioned technical drawings.
   entirely separate from `api/db.py`'s pg8000 connection used by the
   Python pipeline; both point at the same Neon database but are two
   independent client stacks (Node vs. Python), don't conflate them.
+- **Google Drive autosave** (`feature/drive-upload`): `drive.file` scope
+  requested upfront at sign-in (see `lib/auth.ts` above), refresh token
+  encrypted at rest via `lib/crypto.ts` (`ENCRYPTION_KEY` env var, shared
+  across all three Vercel environments). All Drive logic lives in
+  Node/TypeScript (`lib/drive.ts` + `app/api/drive/*`), deliberately kept
+  OUT of the Python pipeline (`api/translate.py` is unchanged) — avoids
+  needing a cross-language-compatible crypto implementation, and avoids
+  the risk of a compiled-extension Python Drive/crypto dependency (see
+  CLAUDE.md's native-extension section). The frontend orchestrates: after
+  `/api/translate` succeeds, if the toggle is on, it separately calls
+  `/api/drive/save` with the resulting Blob URL -- a second, best-effort
+  round trip, not something `/api/translate` itself knows or cares
+  about.
 - **Package manager**: npm, not pnpm. `save-exact=true` via `.npmrc`
   (project-level file — global npm config does NOT have this set, don't
   rely on it).
@@ -532,16 +592,43 @@ translators that don't understand dimensioned technical drawings.
   headless browser before it ever reaches the app). Treated as reliable
   since it's a direct first-hand report of the actual thing that
   matters (a completed sign-in), not an inference from config.
+- Google Drive autosave built end-to-end on `feature/drive-upload`
+  (branched off `dev`): schema migration (`driveAutosaveEnabled`,
+  `driveFolderId` on `User`), `lib/crypto.ts`, `lib/drive.ts`, two new
+  API routes, `lib/auth.ts` scope + encryption changes (including the
+  `events.signIn` fix for already-linked accounts, see the Auth entry
+  above in §2), and a checkbox toggle + post-translate save call in
+  `app/page.tsx`. `npm run build` and `npm run lint` both pass clean.
+  - **Verified**: page renders correctly signed-out (toggle correctly
+    hidden, no console errors) via a real headless-browser check. **NOT
+    verified**: the actual signed-in toggle -> translate -> Drive-save
+    path, and the encryption round-trip against a real stored token --
+    neither is testable without completing Google's real consent screen
+    in an authenticated browser, which this session can't do. Needs a
+    real end-to-end test before trusting it. See §6 for what's blocking
+    that test from even being attempted yet.
+  - `ENCRYPTION_KEY` (fresh 32-byte value, generated this session via
+    `openssl rand -base64 32`) added to `.env.local` and all three Vercel
+    environments (shared value, same pattern as `NEXTAUTH_SECRET`).
 
 ## 6. What's in progress
 
-Nothing is actively mid-edit. User/Google-auth work is fully closed out:
-`feature/google-auth` merged to `dev` (PR #6), `dev` merged to `main`,
-deployed to Production (confirmed `READY`/`target: "production"` via the
-Vercel API), Vercel SSO deployment protection resolved (see §7 for the
-current state and one side effect worth knowing about), and Google
-sign-in confirmed working end-to-end on all three environments —
-Production, `dev` Preview, and `localhost:3000`.
+`feature/drive-upload`'s code is done and build/lint-clean, but has
+**three required manual Google Cloud Console steps, none done yet**,
+without which the feature cannot work in any environment — see §7 for
+the full list. Not committed yet either — new code the user should
+review before it's pushed. Once the Console steps are done, the actual
+end-to-end test (sign in with Drive permission granted, toggle on,
+translate something, confirm a real file lands in a real Drive folder)
+still needs to happen — nobody has done this yet.
+
+Otherwise nothing else mid-edit. User/Google-auth work from earlier is
+fully closed out: `feature/google-auth` merged to `dev` (PR #6), `dev`
+merged to `main`, deployed to Production (confirmed `READY`/`target:
+"production"` via the Vercel API), Vercel SSO deployment protection
+resolved (see §7 for the current state and one side effect worth knowing
+about), and Google sign-in confirmed working end-to-end on all three
+environments — Production, `dev` Preview, and `localhost:3000`.
 
 Env var provisioning in Vercel: done and verified via `vercel env ls`
 (see CLAUDE.md's Vercel env var subsection for the gotchas hit getting
@@ -573,6 +660,36 @@ The natural next slice, per CLAUDE.md's suggested branch order:
 
 ## 7. Known issues / TODOs
 
+- **Google Drive autosave (`feature/drive-upload`) cannot work in ANY
+  environment until three manual steps happen in Google Cloud Console —
+  none done yet, this repo/CLI has no way to do them:**
+  1. **Enable the Google Drive API** for the project (APIs & Services ->
+     Library -> search "Google Drive API" -> Enable). Without this,
+     every Drive API call fails with a 403
+     ("... Drive API has not been used in project ... or it is
+     disabled"), regardless of OAuth scope correctness.
+  2. **Add `https://www.googleapis.com/auth/drive.file` to the OAuth
+     consent screen's configured scopes** (APIs & Services -> OAuth
+     consent screen -> Data Access). A scope not listed there gets
+     stripped or rejected during the consent flow even if the code
+     requests it correctly.
+  3. `drive.file` is a "sensitive" (not "restricted") scope — if the
+     app's OAuth consent screen is still in "Testing" publishing status,
+     only accounts on the configured test-user list can complete this
+     grant; other accounts get blocked at Google's consent screen. Not
+     independently checked whether this project's consent screen is
+     still in Testing or already published — confirm before assuming
+     any account other than the developer's own can use this feature.
+  Do all three before attempting the first real end-to-end test.
+- **No handling yet for a revoked/expired Drive refresh token** (e.g.
+  the user revokes access from their Google Account settings, entirely
+  outside this app). `saveTranslationToDrive` would fail at the
+  token-refresh step with whatever error Google's token endpoint
+  returns; `/api/drive/save` catches it and returns a generic error, and
+  the frontend just shows "Drive save failed" with no specific
+  "reconnect your Drive access" guidance or re-auth prompt. Low priority
+  for MVP (the download button still works regardless), but a real gap
+  if this ever gets real usage.
 - **Vercel Authentication (SSO) deployment protection is now fully
   disabled project-wide** (`ssoProtection.enabled: false`, confirmed via
   the Vercel API's `get_project` — not visible in `vercel project
