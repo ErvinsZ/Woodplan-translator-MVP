@@ -1,10 +1,14 @@
 # Project State
 
-Last updated: 2026-09-19, after adding user database + Google
-authentication on `feature/google-auth` (branched off `dev`) and
-provisioning its env vars in Vercel — see §5/§6. Not yet committed/
-pushed/merged as of this entry (user is doing that manually).
-Previous entries: a second pass fixing `reinsert.py` rendering bugs
+Last updated: 2026-09-20, after `feature/google-auth` merged to `dev` (PR
+#6), a Vercel build failure was found + fixed post-merge (missing Prisma
+client generation), a broken `NEXTAUTH_URL` value on the `dev` Preview
+deployment was found + fixed, and the user confirmed Google sign-in
+actually completes on that Preview deployment — see §5/§6. Production
+sign-in is still unconfirmed.
+Previous entries: adding user database + Google authentication on
+`feature/google-auth` and provisioning its env vars in Vercel.
+Before that: a second pass fixing `reinsert.py` rendering bugs
 (redaction border artifact over diagrams; hardcoded font; overflow
 bleed/wrap-into-diagram, resolved via a deep-shrink-first fallback) plus
 one `glossary.py` content rebalance, verified against real broken-output
@@ -396,9 +400,11 @@ translators that don't understand dimensioned technical drawings.
   at neon.tech).
   `GEMINI_API_KEY` (Google AI Studio free tier) live in `.env.local` and
   all three Vercel environments.
-- Four PRs merged to `dev`: #1 (extraction), #2 (reinsertion/export +
+- Six PRs merged to `dev`: #1 (extraction), #2 (reinsertion/export +
   glossary expansion), #3 (frontend), #4 (dynamic Gemini translation +
-  Spanish/French + the native-extension fix in §4).
+  Spanish/French + the native-extension fix in §4), #5
+  (reinsert/glossary render-bug fixes), #6 (user database + Google auth +
+  the postinstall build fix).
 - Fixed several visible rendering bugs in `reinsert.py`/`glossary.py`,
   all root-caused against real output from `reference/sample_plan.pdf`,
   `reference/sample_plan_2.pdf`, and broken-output repros the user
@@ -476,65 +482,88 @@ translators that don't understand dimensioned technical drawings.
     sign-in — the upload/translate flow on `/` still works fully
     signed-out, unchanged. This session was "get identity + DB wired",
     not "require login to use the tool."
-  - Not yet committed/pushed/PR'd — see §6.
+  - Committed (`869eb68`), pushed, and **merged to `dev` via PR #6**.
+- Fixed a Vercel build failure on `feature/google-auth`, found right
+  after the user pushed and a Preview deploy errored: Turbopack failed
+  with `Module not found: Can't resolve '@/app/generated/prisma/client'`
+  in `lib/prisma.ts`. Root cause: `app/generated/prisma` is correctly
+  gitignored (it's generated code), but nothing regenerated it on
+  Vercel's fresh clone before `next build` ran. Fixed by adding
+  `"postinstall": "prisma generate"` to `package.json` — verified for
+  real by deleting `app/generated` locally, running `npm install`
+  (confirmed `postinstall` fired and regenerated it), then `npm run
+  build` clean, same as what Vercel's pipeline does. Committed as
+  `b73b03a`, pushed directly to `feature/google-auth` (already merged
+  into that PR before #6 landed).
+- Found (via the Vercel API's `get_project`, not the CLI, which doesn't
+  surface this) that **Vercel Authentication (SSO) deployment protection
+  is enabled project-wide, `deploymentType: "all_except_custom_domains"`**
+  — since this project has no custom domain yet, this covers Production
+  too, not just Preview. Flagged as a real landmine for later (any real
+  visitor without Vercel-team access would hit Vercel's own login wall
+  before reaching the app at all) but NOT changed — no custom domain
+  exists yet to make disabling it obviously safe, and it wasn't asked
+  for. Revisit once a custom domain is attached to Production, or
+  earlier if this blocks real user testing.
+- Found + the user fixed a corrupted `NEXTAUTH_URL` value for the
+  Preview environment: after the `dev`-branch Preview deployment came
+  up, Google's own OAuth error page showed
+  `redirect_uri=https://woodplan-translator-mvp-git-dev-....vercel.app,/api/auth/callback/google`
+  — note the **comma** right before the path, meaning the env var's
+  actual stored value had a trailing comma appended
+  (`...vercel.app,` instead of `...vercel.app`), making the whole
+  constructed `redirect_uri` malformed — Google rejected it with `Error
+  400: invalid_request`, a different failure mode than the earlier
+  `redirect_uri_mismatch` (that one was a registration gap; this one was
+  a corrupted stored value). The comma was visible directly in Google's
+  error response, no secret-value inspection needed. User removed and
+  re-added `NEXTAUTH_URL` for Preview and triggered a redeploy (confirmed
+  via `vercel ls`/`vercel inspect`: a fresh Preview deployment exists on
+  the `git-dev` alias, created shortly after the fix was reported done).
+  **User has since confirmed Google sign-in completes on the `dev`
+  Preview deployment** — reported directly by the user after testing in
+  their own (Vercel-authenticated) browser, not independently
+  re-verified via an automated browser test on this end (still can't —
+  the Vercel SSO wall from the previous bullet blocks a session-less
+  headless browser before it ever reaches the app). Treated as reliable
+  since it's a direct first-hand report of the actual thing that
+  matters (a completed sign-in), not an inference from config.
 
 ## 6. What's in progress
 
-`feature/google-auth`'s changes (§5) are complete and build/lint clean,
-but **not yet committed** — working tree has the schema/migration/lib/app
-changes uncommitted on the branch. User is committing/pushing/merging
-this one manually (not delegated this time). Before committing: this is
-new feature work (not a bug fix to existing code), so per the usual
-convention it's one commit for the branch, opened as a normal PR into
-`dev`.
+Nothing is actively mid-edit. `feature/google-auth` is merged to `dev`
+(PR #6); the Vercel-build and `NEXTAUTH_URL` fixes from §5 above both
+landed after that merge (one pushed straight to the feature branch before
+the merge, one applied as a Vercel env var change + redeploy, no code
+change either time).
 
-Env var provisioning in Vercel is DONE and verified via `vercel env ls`
-(confirmed correct row-shape, not just "added"):
+Env var provisioning in Vercel is done and verified via `vercel env ls`
+(confirmed correct row-shape, not just "added" — see CLAUDE.md's Vercel
+env var subsection for the two gotchas hit getting here):
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `NEXTAUTH_SECRET`: one
-  shared value each, scoped to Production + Preview + Development (these
-  three don't need to differ per environment).
-- `NEXTAUTH_URL`: three **separate** entries with three different values
-  (this one DOES need to differ per environment) — Production ->
-  `https://woodplan-translator-mvp.vercel.app`, Preview -> the `dev`
-  branch's stable alias
-  `https://woodplan-translator-mvp-git-dev-ervins-projects-92f05673.vercel.app`
-  (NOT a per-deployment hash URL, which changes every push — the branch
-  alias is what stays constant), Development -> `http://localhost:3000`.
-  - This took two attempts: the first `vercel env add` selected all three
-    environments in one prompt, which gives ALL THREE the SAME value —
-    wrong for this specific var. Root-caused via `vercel env ls`'s own
-    row-grouping (it collapses genuinely-identical values into one row;
-    confirmed by contrast with `DATABASE_URL` etc., which stay as three
-    separate rows despite also being added around the same time). Fixed
-    by removing and re-adding each environment's `NEXTAUTH_URL`
-    separately with its own value. **If a var needs a different value
-    per environment, always `vercel env add <NAME> <environment>` one at
-    a time — never select multiple environments in one add.**
-  - Dead-end worth remembering: `vercel env pull` will NOT reveal real
-    values for **Secret**-type vars outside the `development` scope — it
-    writes the literal placeholder string `"[SENSITIVE]"` instead for
-    `production`/`preview` pulls. Comparing pulled Production/Preview
-    files (or their hashes) to check whether two Secret vars hold the
-    same value will falsely show them as identical (both are just the
-    same placeholder text) even when the real values differ. Don't use
-    that method again — trust `vercel env ls`'s row-grouping instead, or
-    check the dashboard directly.
-- Google Cloud Console redirect URIs: the `redirect_uri_mismatch` on
-  `http://localhost:3000/api/auth/callback/google` (found via the real
-  browser test in the §5 entry above) was reported back to the user as
-  needing a fix in their Google Cloud Console project — NOT something
-  fixable from this repo. **Not independently re-verified after that** —
-  the user moved on to the env var work before a follow-up browser test
-  confirmed the fix. Before trusting sign-in works anywhere, re-run (or
-  ask the user to confirm) that these three exact URIs are registered on
-  the OAuth client:
-  - `http://localhost:3000/api/auth/callback/google`
-  - `https://woodplan-translator-mvp-git-dev-ervins-projects-92f05673.vercel.app/api/auth/callback/google`
-  - `https://woodplan-translator-mvp.vercel.app/api/auth/callback/google`
-    (needed before the first real production deploy)
+  shared value each, scoped to Production + Preview + Development.
+- `NEXTAUTH_URL`: three separate entries, three different values —
+  Production `https://woodplan-translator-mvp.vercel.app`, Preview the
+  `dev` branch's stable alias
+  `https://woodplan-translator-mvp-git-dev-ervins-projects-92f05673.vercel.app`,
+  Development `http://localhost:3000`. Preview's value had a corrupted
+  trailing comma at one point — see §5's entry — fixed and user-confirmed
+  working (real sign-in completed on the `dev` Preview URL).
 
-The natural next slice after this branch merges, per CLAUDE.md's
-suggested branch order:
+**Confirmed working**: Google sign-in on the `dev` Preview deployment
+(user-confirmed, see §5) and on `localhost:3000` (this session's own
+browser test, see the earlier §5 entry — reached Google with the real
+`client_id` before the redirect-URI was even registered; not re-run
+since, but nothing changed on the localhost side afterward). **Still
+unverified**: Production. Its `NEXTAUTH_URL`/redirect-URI were set by
+inference from the same pattern that worked for Preview, but nobody has
+actually clicked sign-in on `https://woodplan-translator-mvp.vercel.app`
+yet — don't assume it works until someone does, especially since
+Production sits behind the same Vercel SSO wall noted above (§7) until a
+custom domain exists.
+
+The natural next slice after that, per CLAUDE.md's suggested branch
+order:
 - `feature/drive-upload` — add `drive.file` scope + offline access to the
   Google provider config, encrypt the resulting `refresh_token` before
   it's persisted (currently unencrypted-at-rest is fine only because no
@@ -556,13 +585,24 @@ suggested branch order:
 
 ## 7. Known issues / TODOs
 
-- **Google sign-in's redirect-URI registration is not independently
-  re-verified as working end-to-end** — see §6's env-var entry for the
-  full status (Vercel env vars ARE confirmed correctly provisioned;
-  the Google Cloud Console side is reported-fixed by the user but not
-  re-tested via browser since). Re-run the browser sign-in test (or ask
-  the user to confirm) before relying on this working in any of the
-  three environments.
+- **Google sign-in is confirmed working on `dev` Preview and
+  `localhost:3000`, but NOT yet on Production** — see §6 for the full
+  status. Production's config was set by inference from the pattern that
+  worked for Preview, not independently tested; also sits behind the
+  Vercel SSO wall below until a custom domain exists. Test it for real
+  before assuming it works.
+- **Vercel Authentication (SSO) deployment protection is enabled
+  project-wide** (`ssoProtection.enabled: true, deploymentType:
+  "all_except_custom_domains"` — found via the Vercel API's
+  `get_project`, not visible in `vercel project inspect`'s CLI output).
+  Since there's no custom domain yet, this gates Production too, not
+  just Preview — any visitor without access to this Vercel team hits
+  Vercel's own login page before reaching the app at all, on any
+  `*.vercel.app` URL including the production one. Not changed this
+  session (no custom domain exists yet to make disabling it obviously
+  safe, and it wasn't asked for) — but this WILL block real users on
+  Production until either a custom domain is attached or this setting is
+  deliberately turned off. Decide before actually launching.
 - **Refresh-token encryption-at-rest (CLAUDE.md's requirement) is not yet
   implemented** — deliberately, because no refresh token exists yet
   (current scope is identity-only, no `drive.file`/offline access
@@ -718,4 +758,19 @@ npx prisma migrate dev --name <description>   # create + apply a migration
 npx prisma generate                            # regenerate app/generated/prisma
                                                 # without a migration (e.g. after
                                                 # a manual schema edit + npx prisma db push)
+# ^ also runs automatically via package.json's "postinstall" script on
+# every `npm install`, including Vercel's build -- app/generated/prisma
+# is gitignored, this is what recreates it on a fresh clone. Don't remove
+# the postinstall script.
+
+# Inspect real Vercel project settings the CLI doesn't surface (e.g. SSO/
+# password deployment protection) -- use the MCP tool, not `vercel project
+# inspect`, which omits them:
+# mcp__plugin_vercel_vercel__get_project with idOrName = the project ID
+
+# After changing a Vercel env var's value (not just adding a new one),
+# the change does NOT apply to already-running deployments -- Vercel
+# snapshots env vars per-deployment at build time. Trigger a new
+# deployment (empty commit, `vercel redeploy <url>`, or the dashboard's
+# Redeploy button) before assuming a fix took effect.
 ```

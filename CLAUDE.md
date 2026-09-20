@@ -350,6 +350,50 @@ pixels**. This means:
   text. Don't use that method to verify secret equality across
   environments; trust `vercel env ls`'s row-grouping instead (see above),
   or check the dashboard directly.
+- **A typo in an env var's VALUE (not just wrong scoping) can be
+  invisible until something downstream constructs a URL from it and the
+  break shows up somewhere unexpected.** `NEXTAUTH_URL` once had a
+  trailing comma (`https://....vercel.app,`) baked into its stored
+  value — nothing in this repo's code or Vercel's own tooling flagged it
+  at set-time. It only surfaced because next-auth concatenates
+  `NEXTAUTH_URL` + `/api/auth/callback/google` to build the OAuth
+  redirect, and Google's own `Error 400: invalid_request` page then
+  echoed the malformed, comma-containing URL back — that error text was
+  the actual proof of the bug, not something inferred. If a downstream
+  service ever echoes back a value it received, read it character by
+  character before assuming the sender-side config is fine.
+- **Changing an env var's value does NOT affect an already-running
+  deployment.** Vercel snapshots env vars per-deployment at build time;
+  a value change in the dashboard/CLI only takes effect on the NEXT
+  deployment. After fixing a var, trigger a redeploy (empty commit,
+  `vercel redeploy <url>`, or the dashboard's Redeploy button) before
+  concluding the fix didn't work.
+- **`vercel project inspect` (the CLI) does not surface Deployment
+  Protection settings** (SSO/password/trusted-IPs) — use the Vercel MCP
+  tool's `get_project` (or the dashboard) instead; it returns
+  `ssoProtection`/`passwordProtection`/`trustedIps` fields the CLI
+  output omits entirely. This project has
+  `ssoProtection.enabled: true, deploymentType:
+  "all_except_custom_domains"` — since there's no custom domain
+  attached, this gates every `*.vercel.app` URL for this project,
+  **Production included**, behind Vercel's own login page for anyone
+  without team access. A session-less automated browser (no Vercel
+  login) hits this wall before ever reaching the app — don't mistake
+  that for an application bug when testing headlessly.
+
+### Prisma client generation on Vercel
+- `app/generated/prisma` (the generated Prisma Client — see the Prisma 7
+  section above for why a custom `output` path is used) is gitignored,
+  correctly, as generated code. **But nothing regenerates it on Vercel's
+  fresh clone unless something triggers `prisma generate` during the
+  build** — without it, `next build` fails with `Module not found: Can't
+  resolve '@/app/generated/prisma/client'` the first time this is
+  deployed from a clean checkout, even though it builds fine locally
+  (because the generated folder already exists on disk from a prior
+  local `prisma generate`/`migrate dev`). Fixed by adding
+  `"postinstall": "prisma generate"` to `package.json` — npm runs this
+  automatically after every `npm install`, Vercel's build included. Keep
+  this script; removing it reintroduces the build failure.
 
 ### Package manager
 - This project uses **npm**, not pnpm. Use npm commands throughout.
