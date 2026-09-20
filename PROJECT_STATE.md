@@ -1,11 +1,11 @@
 # Project State
 
-Last updated: 2026-09-20, after implementing Google Drive autosave
-(`feature/drive-upload`, branched off `dev` — schema + backend + frontend
-done, build/lint clean, NOT yet manually tested end-to-end or
-committed) — see §5/§6/§7. This needs three manual Google Cloud Console
-steps from the user before it can work at all, none done yet as of this
-entry — see §6.
+Last updated: 2026-09-20, after Google Drive autosave (PR #8, merged to
+`dev`) was confirmed working end-to-end by the user (sign in, toggle on,
+translate, file landed in Drive), while the OAuth consent screen is
+still in Google's Testing status. User is now working through Google's
+publishing/verification flow (submitted the new `/privacy` page's URL)
+to open the feature up beyond the developer's own account — see §5/§6.
 Previous entries: `dev` merged to `main`, deployed to a real Production
 environment, Vercel's SSO deployment protection (which was blocking
 Production entirely) resolved, Google sign-in confirmed working
@@ -599,28 +599,36 @@ translators that don't understand dimensioned technical drawings.
   `events.signIn` fix for already-linked accounts, see the Auth entry
   above in §2), and a checkbox toggle + post-translate save call in
   `app/page.tsx`. `npm run build` and `npm run lint` both pass clean.
-  - **Verified**: page renders correctly signed-out (toggle correctly
-    hidden, no console errors) via a real headless-browser check. **NOT
-    verified**: the actual signed-in toggle -> translate -> Drive-save
-    path, and the encryption round-trip against a real stored token --
-    neither is testable without completing Google's real consent screen
-    in an authenticated browser, which this session can't do. Needs a
-    real end-to-end test before trusting it. See §6 for what's blocking
-    that test from even being attempted yet.
+  - Merged to `dev` via PR #8, alongside a new `/privacy` page (linked
+    from a site-wide footer) written for Google's OAuth consent screen
+    verification.
+  - **User has since confirmed a real signed-in end-to-end test**: Drive
+    API enabled in Google Cloud Console, `drive.file` added to the OAuth
+    consent screen's scopes, tested while the app is still in Google's
+    Testing publishing status (their own account as a test user) — sign
+    in with Drive permission granted, toggle on, translate, and the file
+    actually landed in the Drive folder. Reported directly by the user,
+    not independently re-verified via an automated test on this end
+    (same limitation as Google sign-in itself — no way to complete
+    Google's real consent screen from a session-less browser here).
+    Treated as reliable for the same reason those earlier reports were:
+    it's a first-hand report of the actual thing that matters (a real
+    file landing in Drive), not an inference from config.
   - `ENCRYPTION_KEY` (fresh 32-byte value, generated this session via
     `openssl rand -base64 32`) added to `.env.local` and all three Vercel
     environments (shared value, same pattern as `NEXTAUTH_SECRET`).
 
 ## 6. What's in progress
 
-`feature/drive-upload`'s code is done and build/lint-clean, but has
-**three required manual Google Cloud Console steps, none done yet**,
-without which the feature cannot work in any environment — see §7 for
-the full list. Not committed yet either — new code the user should
-review before it's pushed. Once the Console steps are done, the actual
-end-to-end test (sign in with Drive permission granted, toggle on,
-translate something, confirm a real file lands in a real Drive folder)
-still needs to happen — nobody has done this yet.
+User is now working through Google's publishing/verification flow to
+move the OAuth consent screen out of Testing status (submitting the new
+`/privacy` page's URL as part of that). This is entirely a Google Cloud
+Console process outside this repo — nothing to track here beyond
+noting it's in progress. Since `drive.file` is a sensitive scope, this
+will likely trigger Google's verification review (homepage URL, a
+justification per sensitive scope, possibly a demo video), not just a
+status flip — offer to draft the scope-justification text if asked, the
+exact `drive.file` usage is well understood from building the feature.
 
 Otherwise nothing else mid-edit. User/Google-auth work from earlier is
 fully closed out: `feature/google-auth` merged to `dev` (PR #6), `dev`
@@ -639,15 +647,6 @@ one value across Production+Preview+Development; `NEXTAUTH_URL` is three
 separate correct values, one per environment.
 
 The natural next slice, per CLAUDE.md's suggested branch order:
-- `feature/drive-upload` — add `drive.file` scope + offline access to the
-  Google provider config, encrypt the resulting `refresh_token` before
-  it's persisted (currently unencrypted-at-rest is fine only because no
-  refresh token exists yet — do this encryption step as part of, not
-  after, first requesting the scope). Per earlier session Q&A: it would
-  attach to the already-produced PDF bytes from `reinsert_and_export` in
-  `translate.py`, as an additional output destination alongside/instead
-  of the Blob upload — it wouldn't touch extraction/classification/
-  translation at all.
 - Extending the schema beyond identity tables — the full `documents ->
   pages -> text_boxes` hierarchy CLAUDE.md originally described is still
   not started. Now that `users` exists for real, this is unblocked, but
@@ -660,27 +659,18 @@ The natural next slice, per CLAUDE.md's suggested branch order:
 
 ## 7. Known issues / TODOs
 
-- **Google Drive autosave (`feature/drive-upload`) cannot work in ANY
-  environment until three manual steps happen in Google Cloud Console —
-  none done yet, this repo/CLI has no way to do them:**
-  1. **Enable the Google Drive API** for the project (APIs & Services ->
-     Library -> search "Google Drive API" -> Enable). Without this,
-     every Drive API call fails with a 403
-     ("... Drive API has not been used in project ... or it is
-     disabled"), regardless of OAuth scope correctness.
-  2. **Add `https://www.googleapis.com/auth/drive.file` to the OAuth
-     consent screen's configured scopes** (APIs & Services -> OAuth
-     consent screen -> Data Access). A scope not listed there gets
-     stripped or rejected during the consent flow even if the code
-     requests it correctly.
-  3. `drive.file` is a "sensitive" (not "restricted") scope — if the
-     app's OAuth consent screen is still in "Testing" publishing status,
-     only accounts on the configured test-user list can complete this
-     grant; other accounts get blocked at Google's consent screen. Not
-     independently checked whether this project's consent screen is
-     still in Testing or already published — confirm before assuming
-     any account other than the developer's own can use this feature.
-  Do all three before attempting the first real end-to-end test.
+- **Google Drive autosave now confirmed working end-to-end by the user**
+  (see §5) while the OAuth consent screen is still in Google's Testing
+  publishing status — Drive API enabled, `drive.file` added to the
+  consent screen's scopes, real sign-in -> toggle -> translate -> file
+  landed in Drive. **Still only confirmed for the developer's own
+  account** (the one on the Testing status's test-user list) — anyone
+  else's account will be blocked at Google's consent screen until the
+  app moves to "In production" publishing status, which for a sensitive
+  scope like `drive.file` means going through Google's verification
+  review, not just a status flip. That's in progress (see §6) — not
+  done as of this entry, don't assume any account beyond the
+  developer's own can use this feature yet.
 - **No handling yet for a revoked/expired Drive refresh token** (e.g.
   the user revokes access from their Google Account settings, entirely
   outside this app). `saveTranslationToDrive` would fail at the
