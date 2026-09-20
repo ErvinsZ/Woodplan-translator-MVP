@@ -38,7 +38,7 @@ import pymupdf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from geometry import rotation_angle as _rotation_angle
-from ocr_vision import ocr_page
+from ocr_vision import ocr_page, ocr_image_regions
 
 
 def extract_page(page, page_index):
@@ -110,16 +110,27 @@ def extract_page(page, page_index):
 def extract_document(pdf_stream_or_path, document_name=None):
     """Extract all pages of a PDF into the JSON schema.
 
-    A page with zero real vector text boxes is a flattened/rasterized
-    page (a scan, or a plan exported to one page-covering image) rather
-    than a page that's legitimately just sparse -- every real page found
-    in this project's sample data carries at minimum a repeated copyright
-    footer as real vector text, so genuine zero-text pages aren't expected
-    outside this case. Falls back to OCR (see ocr_vision.py) for exactly
-    those pages, per CLAUDE.md's original architecture note; every other
-    page keeps normal vector extraction untouched. An OCR failure (no
-    GOOGLE_VISION_API_KEY configured, Vision API error) is caught and
-    leaves that page with zero text boxes, same as if this fallback
+    Two distinct OCR cases, both handled here (see ocr_vision.py's own
+    module docstring for the full reasoning):
+
+    1. A page with zero real vector text boxes is a flattened/rasterized
+       page (a scan, or a plan exported to one page-covering image)
+       rather than a page that's legitimately just sparse -- every real
+       page found in this project's sample data carries at minimum a
+       repeated copyright footer as real vector text, so genuine
+       zero-text pages aren't expected outside this case. OCRs the WHOLE
+       page in that case.
+    2. A page that DOES have real vector text can still separately
+       contain one or more embedded raster images with their OWN baked-in
+       text (found on a real seller PDF -- a diagram image with real
+       dimension labels in its pixels that plain vector extraction never
+       touches at all, since the page as a whole isn't "empty"). Each
+       embedded image above a minimum size gets OCR'd individually and
+       any text found is ADDED to that page's normal vector text_boxes.
+
+    Either way, an OCR failure (no GOOGLE_VISION_API_KEY configured,
+    Vision API error) is caught per-page and just leaves that page (or
+    that one image) without the extra text, same as if this fallback
     didn't exist -- it only ever adds coverage, never removes it.
     """
     if isinstance(pdf_stream_or_path, (bytes, bytearray)):
@@ -139,6 +150,22 @@ def extract_document(pdf_stream_or_path, document_name=None):
                         "leaving it with zero text boxes",
                         file=sys.stderr,
                     )
+            else:
+                images = [
+                    (info["bbox"], info["xref"])
+                    for info in doc[i].get_image_info(xrefs=True)
+                ]
+                if images:
+                    try:
+                        page["text_boxes"].extend(
+                            ocr_image_regions(doc[i], i, images)
+                        )
+                    except Exception as exc:
+                        print(
+                            f"extract_document: per-image OCR failed on page {i} "
+                            f"({exc!r}), leaving its embedded images untouched",
+                            file=sys.stderr,
+                        )
             pages.append(page)
     finally:
         doc.close()
@@ -187,6 +214,22 @@ class handler(BaseHTTPRequestHandler):
                             f"{page_index} ({exc!r}), leaving it with zero text boxes",
                             file=sys.stderr,
                         )
+                else:
+                    images = [
+                        (info["bbox"], info["xref"])
+                        for info in doc[page_index].get_image_info(xrefs=True)
+                    ]
+                    if images:
+                        try:
+                            result["text_boxes"].extend(
+                                ocr_image_regions(doc[page_index], page_index, images)
+                            )
+                        except Exception as exc:
+                            print(
+                                f"extract handler: per-image OCR failed on page "
+                                f"{page_index} ({exc!r}), leaving its embedded images untouched",
+                                file=sys.stderr,
+                            )
                 result["document"] = document_name or "unknown.pdf"
             finally:
                 doc.close()

@@ -1,13 +1,21 @@
 # Project State
 
-Last updated: 2026-09-20, after verifying the Google Vision OCR fallback
-(`feature/ocr-fallback`, branched off `dev`) against the REAL Vision
-API — the user provided `GOOGLE_VISION_API_KEY`, which surfaced two real
-bugs no amount of mocked-response testing could have caught (an 8x-too-
-tight rotation epsilon for Vision's noisier detected geometry, and
-under-tuned erasure padding), both found by zooming into real rendered
-output and both fixed. Not yet committed — see §5/§6/§7. Previous
-entries: the font-size-consistency fix (PR
+Last updated: 2026-09-20, after the user tested the OCR fallback
+(`feature/ocr-fallback`, branched off `dev`) against a real 55-page
+seller PDF (`reference/sample_with_raft_img.pdf`) and found a real gap:
+pages with real vector text AND a separately-baked-in-text embedded
+image (e.g. a full materials table as one image) were silently
+completely untouched, since the whole-page fallback only ever checked
+whether a PAGE was empty. Added per-image OCR (`ocr_image_regions`) for
+that case — which then immediately surfaced its own real bug on the
+same real PDF (rendering an image's page-region for OCR also rendered
+real vector text positioned near it, causing doubled/ghosted text in
+the output), fixed by OCR-ing each embedded image's raw pixel data
+directly instead. Both confirmed fixed against the same real pages.
+Not yet committed — see §5/§6/§7. Before that: verifying the OCR
+fallback against the real Vision API for the first time (two more real
+bugs found and fixed: an 8x-too-tight rotation epsilon, under-tuned
+erasure padding). Before that: the font-size-consistency fix (PR
 #10, merged to `dev` and `main`); Google Drive autosave (PR #8, merged
 to `dev`) confirmed working end-to-end by the user (sign in, toggle on,
 translate, file landed in Drive), while the OAuth consent screen is
@@ -58,32 +66,57 @@ translators that don't understand dimensioned technical drawings.
   returns extracted JSON). Defines the core JSON schema every later stage reads/
   writes (see `pipeline` sub-object below). Every text_box now also carries
   `"source": "vector"` or `"source": "ocr"` (see below). `extract_document`
-  falls back to `ocr_vision.py` for any page with zero real vector text
-  boxes -- a flattened/rasterized page (scan, or a plan exported to one
-  page-covering image), per CLAUDE.md's original architecture note. An
-  OCR failure (no API key, Vision error) just leaves that page with zero
-  text boxes, same as if the fallback didn't exist.
+  calls into `ocr_vision.py` for two distinct cases: the WHOLE page for a
+  page with zero real vector text boxes (a flattened/rasterized scan or
+  export-to-image plan, per CLAUDE.md's original architecture note), or
+  EACH embedded image individually for a page that does have real vector
+  text but also contains one or more raster images with their own
+  separately baked-in text (found on a real seller PDF -- a full
+  materials table baked entirely into one embedded image on an otherwise
+  normal page). Either way, an OCR failure (no API key, Vision error) is
+  caught per-page/per-image and just leaves that content untouched, same
+  as if the fallback didn't exist -- it only ever adds coverage.
 - `api/geometry.py` — `rotation_angle(line_dir)`, split out of extract.py
   into its own dependency-free module specifically so `ocr_vision.py` can
   use the exact same angle math without a circular import (`extract.py`
   needs to import `ocr_vision.py` for the fallback above; `ocr_vision.py`
   needed the same rotation calculation extract.py already had).
-- `api/ocr_vision.py` — Google Cloud Vision `DOCUMENT_TEXT_DETECTION`
-  fallback extractor, called by `extract_document` for a flattened page.
-  Renders the page to an image (`page.get_pixmap`), POSTs it to Vision's
-  REST API via a plain API key (`GOOGLE_VISION_API_KEY`) + `urllib` --
-  deliberately NOT a service-account/OAuth2 flow, which would need a
-  crypto library to sign JWTs (PyJWT/cryptography or google-auth's own
-  dependency chain) -- `cryptography` ships a compiled Rust extension,
-  exactly the class of dependency that already crashed real Vercel
-  Python deployments once this project (`google-genai`, `psycopg
-  [binary]` -- see §4). Reconstructs one text_box per VISUAL LINE from
-  Vision's word/symbol hierarchy (Vision has no explicit line grouping,
-  only a break-type hint -- SPACE/EOL_SURE_SPACE/LINE_BREAK/HYPHEN -- on
-  each word's last symbol), converts pixel coordinates back to PDF
-  points, and estimates a font size from word-box height (Vision gives
-  no font size, there's no real original font to match here anyway).
-  Every emitted text_box carries `"source": "ocr"`.
+- `api/ocr_vision.py` — Google Cloud Vision `DOCUMENT_TEXT_DETECTION`,
+  called by `extract_document` for TWO distinct cases: `ocr_page` for a
+  fully flattened page (renders the whole page via `page.get_pixmap`),
+  and `ocr_image_regions` for individual embedded raster images with
+  their own baked-in text on an otherwise-normal (has-real-vector-text)
+  page -- see below and its own module docstring for why these two use
+  genuinely different rendering strategies, not just different scope.
+  POSTs to Vision's REST API via a plain API key (`GOOGLE_VISION_API_KEY`)
+  + `urllib` -- deliberately NOT a service-account/OAuth2 flow, which
+  would need a crypto library to sign JWTs (PyJWT/cryptography or
+  google-auth's own dependency chain) -- `cryptography` ships a compiled
+  Rust extension, exactly the class of dependency that already crashed
+  real Vercel Python deployments once this project (`google-genai`,
+  `psycopg[binary]` -- see §4). Reconstructs one text_box per VISUAL LINE
+  from Vision's word/symbol hierarchy (Vision has no explicit line
+  grouping, only a break-type hint --
+  SPACE/EOL_SURE_SPACE/LINE_BREAK/HYPHEN -- on each word's last symbol),
+  converts coordinates back to PDF points, and estimates a font size from
+  word-box height (Vision gives no font size, there's no real original
+  font to match here anyway). Every emitted text_box carries
+  `"source": "ocr"`.
+  - `ocr_image_regions` OCRs each embedded image's OWN RAW PIXEL DATA,
+    extracted directly via its PDF xref (`_ocr_raw_image`) -- NOT a
+    `get_pixmap(clip=...)` render of that image's page-space region
+    (which is exactly what `ocr_page` does, correctly, for a genuinely
+    empty whole page). Root-caused the hard way on a real seller PDF:
+    rendering a region for OCR also renders any real vector text
+    positioned on top of or near that embedded image, so Vision
+    re-detected text ALREADY correctly captured by normal vector
+    extraction, and both got drawn independently at slightly different
+    positions -- visible as literal doubled/ghosted text in the real
+    output. OCR-ing the raw image bytes directly is immune to this by
+    construction. Also skips images below a minimum size (not worth an
+    API call) and images mostly overlapped by an already-processed
+    image on the same page (also found for real: a "zoomed detail"
+    callout image overlapping three of a page's other four images).
   - **A real bug was caught by the module's own mocked-response tests,
     not left in**: the rotation-angle calculation originally used
     `dx or 1` as a defensive fallback for a degenerate zero-vector case
@@ -745,26 +778,64 @@ translators that don't understand dimensioned technical drawings.
        at 3.0pt. Settled on 5.0pt after re-verifying the exact same
        regions clean at each step -- see `reinsert.py`'s own comment for
        the full before/after.
-  - Not yet committed as of the real-API verification pass — see §6.
+  - **A real gap found by the user testing a real seller PDF
+    (`reference/sample_with_raft_img.pdf`, 55 pages, gitignored like the
+    project's other secondary fixtures -- kept local, not committed)
+    that the synthetic test fixture structurally could not surface**:
+    pages with real
+    vector text AND a separate embedded image with its OWN baked-in
+    text (e.g. a full 20+ row materials/cost table, baked entirely into
+    one image) were silently completely untouched -- the whole-page
+    flatness fallback correctly never triggers for such a page (it does
+    have real text), and nothing else was checking individual embedded
+    images at all. Added `ocr_image_regions` to `ocr_vision.py`, wired
+    into `extract_document` for exactly this case (real text present +
+    at least one embedded image above a minimum size): OCRs each image
+    individually and ADDS any text found to that page's existing
+    vector-extracted text_boxes.
+    - **A second real bug found immediately by testing against that
+      same real PDF, not caught in dev**: the first implementation
+      OCR'd each image via a `get_pixmap(clip=image_bbox)` page-region
+      render, same mechanism as the whole-page case. That's wrong for
+      THIS case specifically: rendering a page region also renders any
+      REAL VECTOR TEXT positioned on top of or near that image, so
+      Vision re-detected text ALREADY correctly captured by normal
+      vector extraction -- both the real vector span and the spurious
+      OCR duplicate got drawn, independently, at slightly different
+      positions, producing literal doubled/ghosted text in the real
+      rendered output (e.g. two overlapping "4335 mm" labels). Confirmed
+      by cross-checking the real page's own vector text dump: every
+      single "duplicated" label was already a real vector span.
+      Rewrote `ocr_image_regions` to OCR each embedded image's OWN RAW
+      PIXEL DATA instead, extracted directly via its PDF xref
+      (`_ocr_raw_image`) -- immune to this by construction, since a raw
+      image file has no vector content at all. Re-verified against the
+      same real page: the raw images turned out to have ZERO baked-in
+      text at all (every visible label really was vector text, which is
+      why the page looked doubled rather than simply having extra
+      content) -- the fix produces a byte-for-byte-equivalent-looking
+      clean render now, confirmed visually. Also added overlap-based
+      deduplication (`_MAX_IMAGE_OVERLAP_RATIO`) as a secondary
+      safeguard for the different case of two embedded images
+      genuinely, substantially overlapping each other in page space
+      (also found on this same real PDF -- a "zoomed detail" callout
+      image overlapping three of the page's other four images).
+  - Not yet committed as of this latest real-PDF verification pass — see §6.
 
 ## 6. What's in progress
 
-`feature/ocr-fallback`'s code is done and verified against the real
-Vision API (§5) -- `GOOGLE_VISION_API_KEY` is live in `.env.local`
-(Vercel env vars not yet provisioned, see §7). Not committed yet; the
-user should review the two real fixes from the real-API pass (§5)
-before it's pushed.
+`feature/ocr-fallback`'s code is done and verified against BOTH the real
+Vision API (synthetic fixture, §5) AND a real 55-page seller PDF with
+real embedded images (`sample_with_raft_img.pdf`, §5) -- the whole-page
+fallback, per-image OCR, and the raw-image-extraction fix have all been
+confirmed against real data, not just theory. `GOOGLE_VISION_API_KEY` is
+live in `.env.local` (Vercel env vars not yet provisioned, see §7). Not
+committed yet; the user should review before it's pushed.
 
-Still open: **no genuinely flattened/scanned real plan PDF has been
-tested** -- every real-API run so far used the same synthetic fixture
-(a real page's real vector text re-rendered as one image), which
-exercises the real Vision REST contract and real OCR-detection geometry
-but not a real scanner's actual artifacts (skew, noise, compression).
-Worth running against one real flattened seller PDF before trusting
-this against real uploads.
-
-User is now working through Google's publishing/verification flow to
-move the OAuth consent screen out of Testing status (submitting the new
+Still open, lower priority than before this real-PDF testing pass: **no
+genuinely scanner-originated (camera/scan artifacts) test PDF has been
+tried** -- see §7 for the current status of what has and hasn't been
+covered.
 
 User is now working through Google's publishing/verification flow to
 move the OAuth consent screen out of Testing status (submitting the new
@@ -806,30 +877,40 @@ The natural next slice, per CLAUDE.md's suggested branch order:
 ## 7. Known issues / TODOs
 
 - **Google Vision OCR fallback is not rate-limited or cost-tracked at
-  all** — unlike everything else in this stack (Neon's hard-capped free
-  tier, Gemini's in-process rate limiting per CLAUDE.md's own deliberate
-  design), Cloud Vision's `DOCUMENT_TEXT_DETECTION` has a real, fairly
-  modest free tier (historically ~1000 units/month, 1 page = 1 unit,
-  then billed per request past that) and this pipeline will call it once
-  per flattened page with zero guardrails — a handful of multi-page
-  flattened documents could exhaust the free tier in one afternoon. Not
-  addressed this session (out of scope for "implement the fallback" as
-  asked) — worth a usage counter or a hard per-document page cap before
-  this sees real, unsupervised traffic.
+  all — and the real cost exposure is now confirmed worse than
+  originally estimated.** Unlike everything else in this stack (Neon's
+  hard-capped free tier, Gemini's in-process rate limiting per
+  CLAUDE.md's own deliberate design), Cloud Vision's
+  `DOCUMENT_TEXT_DETECTION` has a real, fairly modest free tier
+  (historically ~1000 units/month, 1 request = 1 unit, then billed past
+  that). The original estimate assumed "1 call per flattened page," but
+  `reference/sample_with_raft_img.pdf` (real seller PDF, 55 pages)
+  showed a single page can have 4 embedded images, several large enough
+  to pass the size filter — meaning a single MIXED page (not even a
+  flattened one) can cost multiple Vision calls, and a real multi-page
+  image-heavy document could burn through the monthly free tier in a
+  single translation request. Still not addressed (out of scope for
+  what was asked) — a hard per-document call budget is worth doing
+  before this sees real, unsupervised traffic, more urgently than
+  originally scoped.
 - **`GOOGLE_VISION_API_KEY` is only confirmed present in `.env.local`** —
   not yet provisioned in Vercel's actual project environment variables
   (Production/Preview/Development), same category of gap as every other
   API key was at some point before deploy. Add it via `vercel env add`
   before merging this branch, or the real Vision call will fail on any
   deployed environment even though it works locally.
-- **No real flattened/scanned test PDF exists yet** — the real-API
-  verification so far (§5) used a synthetic fixture (a real page's real
-  vector text re-rendered as one image). This exercises the real Vision
-  REST contract and real OCR-detection geometry, which is what surfaced
-  both real bugs fixed this pass — but it has never seen genuine scanner
-  artifacts (skewed pages, real noise/compression, actual misreads on
-  unfamiliar handwriting-adjacent fonts). Get one real flattened plan
-  PDF (or scan one) before trusting this against real seller uploads.
+- **No real SCANNED (camera/scanner-originated) test PDF exists yet** —
+  everything verified so far is either a synthetic flattened fixture (a
+  real page's real vector text re-rendered as one image) or a real
+  born-digital seller PDF with embedded images
+  (`sample_with_raft_img.pdf`, confirmed to have zero real scan
+  artifacts — its images are clean exports, not photographs of paper).
+  This has exercised the real Vision REST contract, real OCR-detection
+  geometry, and a real multi-image mixed-page layout — genuinely
+  thorough coverage now — but still never a real scanner's actual skew,
+  noise, or compression artifacts. Lower priority than it was before
+  this session's real-PDF testing, but still worth doing if a customer
+  ever uploads an actual scanned plan.
 - **Google Drive autosave now confirmed working end-to-end by the user**
   (see §5) while the OAuth consent screen is still in Google's Testing
   publishing status — Drive API enabled, `drive.file` added to the
