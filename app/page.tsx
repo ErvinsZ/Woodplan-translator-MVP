@@ -1,9 +1,12 @@
 "use client";
 
 import { upload } from "@vercel/blob/client";
+import { useSession } from "next-auth/react";
 import { useCallback, useRef, useState } from "react";
 
 type Status = "idle" | "uploading" | "translating" | "done" | "error";
+
+type DriveSaveStatus = "idle" | "saving" | "saved" | "error";
 
 type Lang = "de" | "es" | "fr";
 
@@ -19,6 +22,7 @@ function formatBytes(bytes: number) {
 }
 
 export default function Home() {
+  const { data: session } = useSession();
   const [file, setFile] = useState<File | null>(null);
   const [lang, setLang] = useState<Lang>("de");
   const [status, setStatus] = useState<Status>("idle");
@@ -26,7 +30,30 @@ export default function Home() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [downloadName, setDownloadName] = useState("");
   const [dragActive, setDragActive] = useState(false);
+  // null = no pending toggle click, follow the account-level setting
+  // from the session (persists across sessions/devices -- "connect
+  // once, auto-save forever"). Set only optimistically while a toggle
+  // click is in flight or just failed, not synced from session via an
+  // effect (that pattern causes an extra render on every session poll).
+  const [pendingDriveEnabled, setPendingDriveEnabled] = useState<boolean | null>(null);
+  const [driveSaveStatus, setDriveSaveStatus] = useState<DriveSaveStatus>("idle");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const driveEnabled = pendingDriveEnabled ?? session?.user?.driveAutosaveEnabled ?? false;
+
+  const toggleDrive = useCallback(async () => {
+    const next = !driveEnabled;
+    setPendingDriveEnabled(next);
+    try {
+      await fetch("/api/drive/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      });
+    } catch {
+      setPendingDriveEnabled(!next);
+    }
+  }, [driveEnabled]);
 
   const reset = useCallback(() => {
     setFile(null);
@@ -34,6 +61,7 @@ export default function Home() {
     setErrorMessage("");
     setDownloadUrl(null);
     setDownloadName("");
+    setDriveSaveStatus("idle");
   }, []);
 
   const pickFile = useCallback((picked: File | null) => {
@@ -74,13 +102,29 @@ export default function Home() {
       setDownloadUrl(data.download_url);
       setDownloadName(data.filename);
       setStatus("done");
+
+      // Purely additive -- the download button above already has the
+      // file regardless of whether this succeeds.
+      if (driveEnabled) {
+        setDriveSaveStatus("saving");
+        try {
+          const driveRes = await fetch("/api/drive/save", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ blob_url: data.download_url, filename: data.filename }),
+          });
+          setDriveSaveStatus(driveRes.ok ? "saved" : "error");
+        } catch {
+          setDriveSaveStatus("error");
+        }
+      }
     } catch (err) {
       setStatus("error");
       setErrorMessage(
         err instanceof Error ? err.message : "Translation failed. Please try again."
       );
     }
-  }, [file, lang]);
+  }, [file, lang, driveEnabled]);
 
   const selectedLanguage = LANGUAGES.find((l) => l.code === lang)!;
 
@@ -122,6 +166,18 @@ export default function Home() {
               </button>
             ))}
           </div>
+
+          {session && (
+            <label className="mt-4 flex w-fit cursor-pointer items-center gap-2 font-mono text-xs uppercase tracking-[0.1em] text-muted hover:text-foreground">
+              <input
+                type="checkbox"
+                checked={driveEnabled}
+                onChange={toggleDrive}
+                className="h-3.5 w-3.5 accent-blueprint"
+              />
+              Also save to Google Drive
+            </label>
+          )}
 
           <div className="mt-6">
             {!file && (
@@ -218,6 +274,14 @@ export default function Home() {
                       Translate another
                     </button>
                   </div>
+                )}
+
+                {driveSaveStatus !== "idle" && (
+                  <p className="mt-3 font-mono text-xs uppercase tracking-[0.1em] text-muted">
+                    {driveSaveStatus === "saving" && "Saving to Google Drive…"}
+                    {driveSaveStatus === "saved" && "Saved to Google Drive."}
+                    {driveSaveStatus === "error" && "Drive save failed — file is still available above."}
+                  </p>
                 )}
               </div>
             )}

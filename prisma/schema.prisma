@@ -15,19 +15,27 @@ datasource db {
 // Auth.js (next-auth v4 + @auth/prisma-adapter) standard schema for
 // Google OAuth sign-in. Database session strategy, not JWT -- sessions
 // and OAuth accounts both live here so "connect once" survives across
-// stateless Vercel function invocations. drive.file scope/refresh-token
-// handling arrives with the Drive-upload feature; Account already has
-// the columns for it (refresh_token etc.), encrypt that column at rest
-// once it's actually populated -- see CLAUDE.md.
+// stateless Vercel function invocations. Google provider now requests
+// drive.file + offline access at sign-in (see lib/auth.ts), so
+// Account.refresh_token is populated -- encrypted at rest via
+// lib/crypto.ts, wrapped around the adapter's linkAccount, per CLAUDE.md.
 model User {
-  id            String    @id @default(cuid())
-  name          String?
-  email         String?   @unique
-  emailVerified DateTime? @map("email_verified")
-  image         String?
-  createdAt     DateTime  @default(now()) @map("created_at")
-  accounts      Account[]
-  sessions      Session[]
+  id                   String    @id @default(cuid())
+  name                 String?
+  email                String?   @unique
+  emailVerified        DateTime? @map("email_verified")
+  image                String?
+  createdAt            DateTime  @default(now()) @map("created_at")
+  // Drive autosave: an account-level toggle, not a per-translation one --
+  // "connect once, auto-save forever" per CLAUDE.md's original design
+  // intent. driveFolderId is the Drive file ID of the app's save folder,
+  // deliberately NOT the folder name -- Drive IDs stay valid if the user
+  // renames the folder, only invalidated if it's deleted/trashed (see
+  // lib/drive.ts's findOrCreateFolder, which recreates it if so).
+  driveAutosaveEnabled Boolean   @default(false) @map("drive_autosave_enabled")
+  driveFolderId        String?   @map("drive_folder_id")
+  accounts             Account[]
+  sessions             Session[]
 
   @@map("users")
 }
@@ -38,7 +46,7 @@ model Account {
   type              String
   provider          String
   providerAccountId String  @map("provider_account_id")
-  refresh_token     String? @db.Text
+  refresh_token     String? @db.Text // encrypted at rest -- see lib/crypto.ts
   access_token      String? @db.Text
   expires_at        Int?
   token_type        String?

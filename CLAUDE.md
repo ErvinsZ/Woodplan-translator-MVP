@@ -409,6 +409,36 @@ pixels**. This means:
   automatically after every `npm install`, Vercel's build included. Keep
   this script; removing it reintroduces the build failure.
 
+### NextAuth v4 gotchas (confirmed by reading node_modules source, not assumed)
+- **NextAuth v4's callback-handler only calls the adapter's `linkAccount`
+  for a BRAND NEW OAuth account.** For an account that's already linked
+  (matching `provider` + `providerAccountId`), it skips `linkAccount`
+  entirely and just creates a new session — confirmed directly in
+  `node_modules/next-auth/core/lib/callback-handler.js`. This means: if
+  you add a new scope (e.g. `drive.file`) or otherwise expect a
+  repeat/re-consent sign-in to persist fresh tokens via the adapter, it
+  won't — the adapter never sees them. Fix: use an `events.signIn`
+  handler instead (or in addition) for anything that needs to persist on
+  every sign-in, not just the first. `account` inside `events.signIn` is
+  the raw object straight from the OAuth token exchange, independent of
+  whatever the adapter did or didn't do with it, so it reliably has
+  fresh tokens whenever Google issued them — see `lib/auth.ts`'s
+  `events.signIn` for the working pattern (used there to keep the Drive
+  `refresh_token` current even for accounts linked before that scope was
+  ever requested).
+- **`next-auth/adapters`' `AdapterAccount` type and
+  `@auth/prisma-adapter`'s own (separately bundled) `@auth/core`
+  `AdapterAccount` type disagree on `token_type`'s type-level branding**
+  (`string` vs `Lowercase<string>`) — a cross-package type-declaration
+  mismatch, not a real runtime shape difference. Wrapping/overriding
+  `PrismaAdapter`'s methods (e.g. to intercept `linkAccount` for
+  encryption) will hit a real TypeScript error passing an
+  `AdapterAccount`-typed object to `base.linkAccount`. An `as any` at
+  that one call site, with a comment explaining why, is the pragmatic
+  fix — chasing the exact internal `@auth/core` type isn't worth it (it
+  isn't even cleanly importable, it's nested inside
+  `@auth/prisma-adapter/node_modules/`).
+
 ### Package manager
 - This project uses **npm**, not pnpm. Use npm commands throughout.
 

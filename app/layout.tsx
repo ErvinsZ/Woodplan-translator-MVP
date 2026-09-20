@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { Space_Grotesk, IBM_Plex_Mono } from "next/font/google";
 import { AuthStatus } from "./components/AuthStatus";
 import { Providers } from "./providers";
@@ -33,6 +34,11 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             <AuthStatus />
           </div>
           {children}
+          <footer className="px-6 py-4 text-center font-mono text-[11px] uppercase tracking-[0.1em] text-muted">
+            <Link href="/privacy" className="underline underline-offset-4 hover:text-foreground">
+              Privacy Policy
+            </Link>
+          </footer>
         </Providers>
       </body>
     </html>
