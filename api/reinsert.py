@@ -109,6 +109,41 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
          as known bug #1).
     Normal (fitting) spans are untouched by any of this and still use the
     known-bug-1-safe `insert_text`-at-origin path.
+  - `_available_length` measured every span's "room to grow" as its own
+    ORIGINAL bbox width — exactly as wide as that specific ENGLISH word
+    happened to render, not a real layout boundary. For a vertical list
+    or a hand-wrapped multi-line heading, that's not a real constraint at
+    all: it's an artifact of how long the source-language word/line
+    happened to be. Root-caused against a real reported bug (a Tools
+    checklist where every item is genuinely the same 20pt in the
+    original, but the translated render looked "randomly" tiny/large/
+    mixed) by extracting real span data from both the original and the
+    broken output: "Jig Saw" (a short original, ~72pt of inherited bbox
+    slack) -> "Scie sauteuse" got crushed to 12.6pt, while "Safety
+    goggles and gloves" (a long original, ~227pt of slack) stayed full
+    20pt — purely because the English words differed in length, nothing
+    to do with the translations' actual lengths or real page layout.
+    Same mechanism one level up on a two-line title, where the original
+    author's arbitrary line-break point became two independent bbox
+    widths. Fixed by loosening the constraint (real page margin, capped
+    to `_LOOSE_WIDTH_MULTIPLIER` × the original width) for any span with
+    no real same-line neighbor (`_has_same_line_neighbor`) — genuinely
+    tight contexts (adjacent cells, captions sitting directly above their
+    own diagram part in a row of same parts, e.g. the D1-A/D1-B labels on
+    the real inventory-list fixture) keep the exact prior tight behavior,
+    verified unchanged (218 real spans checked directly). Re-ran the full
+    15-page pipeline for German plus both flagged pages for Spanish and
+    French against the real sample fixtures: the checklist renders fully
+    uniform at 20pt with zero shrink in every case tried, the two-line
+    title renders either fully uniform or with a real, proportionate
+    (not wild) size difference when the translation genuinely doesn't
+    fit evenly across both lines, and no dimension-critical or
+    diagram-adjacent content regressed. Known blind spot, same as the
+    diagonal-text approximation above: extract.py doesn't capture diagram
+    image bboxes, so "no text neighbor" can't fully rule out a raster
+    diagram occupying the loosened space — `_LOOSE_WIDTH_MULTIPLIER`
+    exists specifically to bound that risk rather than trusting an empty
+    neighbor check all the way to the page edge.
 """
 
 import base64
@@ -121,6 +156,22 @@ import pymupdf
 # Below this, an angle is treated as exactly axis-aligned (0/±90) when
 # picking the bbox dimension to measure available space against.
 _ROTATION_EPSILON_DEGREES = 0.5
+
+# For a horizontal span with no real neighbor to its right (see
+# _has_same_line_neighbor), how much page margin to assume is available
+# before treating the page edge itself as the constraint. A generic
+# minimal print margin, not derived from any specific document.
+_LOOSE_PAGE_MARGIN = 24.0
+# Cap on how much further than its own original bbox width a neighborless
+# span is allowed to grow, even when the page margin alone would allow
+# more -- bounds the one real risk this heuristic can't see: whether a
+# diagram's raster image (extract.py doesn't capture image bboxes, see
+# PROJECT_STATE.md) actually occupies that "empty" space. 3x comfortably
+# covers every real translated/original length ratio found in this
+# project so far (e.g. "Shut" -> "Geschlossen" is ~2.75x, see
+# _DEEP_SHRINK_FLOOR_RATIO's comment) without unconditionally trusting
+# "no text neighbor" all the way to the page edge.
+_LOOSE_WIDTH_MULTIPLIER = 3.0
 
 # CLAUDE.md: "Shrink font down to a floor (~75-80% of original) before
 # flagging for human review."
@@ -232,32 +283,101 @@ def _deep_shrink_fit(translated, original_size, fontname, available_len):
     return None
 
 
-def _available_length(text_box, fontname):
+def _has_same_line_neighbor(text_box, all_boxes):
+    """True if another span on the page sits immediately to this one's
+    right on the same horizontal band (bboxes vertically overlap, and the
+    other span starts at or after this one's right edge).
+
+    This is the safety gate for _available_length's loosened fallback
+    below: a real neighbor here — an adjacent table cell, a caption next
+    to another caption — means the original bbox width WAS a genuine
+    layout constraint, so behavior for that span stays exactly as before.
+    No neighbor does NOT prove the space to the right is empty —
+    extract.py doesn't capture diagram image bboxes (see
+    PROJECT_STATE.md), so a raster diagram could occupy that space with
+    no text neighbor around to reveal it. That residual risk is exactly
+    why the loosened fallback also caps growth via
+    _LOOSE_WIDTH_MULTIPLIER instead of trusting "no text neighbor" alone
+    all the way to the page edge.
+    """
+    bbox = text_box["bbox"]
+    y0, y1, x1 = bbox[1], bbox[3], bbox[2]
+    for other in all_boxes:
+        if other is text_box:
+            continue
+        obbox = other["bbox"]
+        if obbox[3] <= y0 or obbox[1] >= y1:
+            continue  # no vertical overlap -- not on the same horizontal band
+        if obbox[0] >= x1 - 1.0:
+            return True
+    return False
+
+
+def _available_length(text_box, fontname, all_boxes=None, page_width=None):
     """How much room the original span had along its writing direction.
 
-    Axis-aligned text: bbox width/height, exactly as pipeline_tested.py
-    validated against real data.
+    Axis-aligned horizontal text (angle ~0): the tight bbox width is
+    often NOT a real constraint at all for this shape of content — it's
+    just how wide the ORIGINAL-language word or line happened to render,
+    which is arbitrary once translated. Root-caused against real data: a
+    vertical checklist where every item is genuinely the same original
+    font size, but each translated item independently shrank by however
+    much LONGER its own translation happened to be than that ONE item's
+    specific English word — "Jig Saw" (a short original, so almost no
+    slack in its inherited bbox) crushed down to 12.6pt from 20pt, while
+    "Safety goggles and gloves" (a long original, so lots of inherited
+    slack) stayed full-size, purely because the English words happened to
+    differ in length. Same mechanism on a hand-wrapped two-line title.
+    Neither has anything to do with real page layout.
+
+    When `all_boxes`/`page_width` are given and the span has no same-line
+    neighbor (see `_has_same_line_neighbor`), this loosens the constraint
+    to real page margin or a bounded multiple of the tight width, instead
+    of the tight bbox itself. Genuinely tight contexts (adjacent cells,
+    a caption beside another caption or close to a diagram WITH a text
+    neighbor) are unaffected — the neighbor check keeps them on the exact
+    prior behavior. Vertical/diagonal spans are also unaffected; every
+    diagonal span found so far is a numeric angle-callout (classification
+    "code", never translated), so there's no real content to validate
+    loosening against there yet.
+
+    Axis-aligned vertical text (angle ~±90): bbox height, exactly as
+    pipeline_tested.py validated against real data — not loosened, same
+    reasoning as diagonal text above.
 
     Diagonal text: the axis-aligned bbox doesn't decompose into a single
     along-direction length without also knowing font ascent/descent, so
     this falls back to the original text's own rendered width as an
-    "it fit before" reference. Every diagonal span found so far in
-    sample_plan.pdf is a numeric angle-callout (classification "code"),
-    never translated, so this approximation isn't exercised by real
-    content yet — flagged here rather than silently assumed correct.
+    "it fit before" reference — flagged here rather than silently assumed
+    correct, since it isn't exercised by real content yet either.
     """
     bbox = text_box["bbox"]
     angle = text_box["rotation_angle"]
 
     if abs(angle) < _ROTATION_EPSILON_DEGREES:
-        return bbox[2] - bbox[0]
+        tight = bbox[2] - bbox[0]
+        if (
+            all_boxes is not None
+            and page_width is not None
+            and not _has_same_line_neighbor(text_box, all_boxes)
+        ):
+            margin_cap = max(page_width - _LOOSE_PAGE_MARGIN - bbox[0], tight)
+            multiplier_cap = tight * _LOOSE_WIDTH_MULTIPLIER
+            return max(tight, min(margin_cap, multiplier_cap))
+        return tight
     if abs(abs(angle) - 90) < _ROTATION_EPSILON_DEGREES:
         return bbox[3] - bbox[1]
     return _text_width(text_box["text"], text_box["font"]["size"], fontname)
 
 
-def refit_span(text_box):
+def refit_span(text_box, all_boxes=None, page_width=None):
     """Fills in pipeline.overflow / used_font_size / available_len.
+
+    `all_boxes`/`page_width` (the page's other text boxes and its width)
+    are optional context passed through to `_available_length` so it can
+    loosen the constraint for a span with no same-line neighbor — see
+    that function's docstring. Omit them to get the old tight-bbox-only
+    behavior (e.g. for a standalone/unit-tested single span).
 
     Escalates needs_review to True on overflow, but never clears a
     needs_review already set by classify_translate.py (e.g. an unmatched
@@ -271,7 +391,7 @@ def refit_span(text_box):
     # rendering in a wider/narrower substituted family (e.g. Courier) would
     # make this overflow check silently wrong for the real render.
     fontname = _base14_font(text_box["font"]["name"])
-    available_len = _available_length(text_box, fontname)
+    available_len = _available_length(text_box, fontname, all_boxes, page_width)
 
     used_size = font_size
     fits = _text_width(translated, used_size, fontname) <= available_len
@@ -377,19 +497,22 @@ def _insert_span(page, text_box, next_line_gap=None):
         # it anyway on one unclipped line would run straight past this
         # span's own column border and paint over whatever sits to the
         # right (adjacent cell text, a diagram). Wrap it into a box
-        # instead: capped to the
-        # ORIGINAL bbox width (can't spill sideways) and sized to just the
-        # number of lines the text actually needs, capped at both
-        # _OVERFLOW_WRAP_LINES_CAP and (if known) the real vertical gap to
-        # the next span directly below in the same column -- a flat
-        # multi-line-tall guess here would just as easily run into the
-        # NEXT original line's own span immediately below, since a wrapped
-        # source paragraph is several stacked single-line spans, not one
-        # tall one, and their line-to-line gap is usually tighter than
-        # even 2 lines' worth of a shrunk-to-floor font (confirmed by
-        # testing against a real multi-span wrapped heading).
+        # instead: capped to the span's available width (can't spill past
+        # whatever _available_length already decided was safe -- the
+        # tight original bbox width for a span with a real same-line
+        # neighbor, or the loosened budget for one without, see
+        # _available_length) and sized to just the number of lines the
+        # text actually needs, capped at both _OVERFLOW_WRAP_LINES_CAP
+        # and (if known) the real vertical gap to the next span directly
+        # below in the same column -- a flat multi-line-tall guess here
+        # would just as easily run into the NEXT original line's own span
+        # immediately below, since a wrapped source paragraph is several
+        # stacked single-line spans, not one tall one, and their
+        # line-to-line gap is usually tighter than even 2 lines' worth of
+        # a shrunk-to-floor font (confirmed by testing against a real
+        # multi-span wrapped heading).
         bbox = text_box["bbox"]
-        width = max(bbox[2] - bbox[0], used_size)
+        width = max(text_box["pipeline"]["available_len"], used_size)
         line_height = used_size * _LINE_HEIGHT_RATIO
         lines_needed = math.ceil(_text_width(translated, used_size, fontname) / max(width, 1))
         lines = min(lines_needed + _OVERFLOW_WRAP_LINE_SLACK, _OVERFLOW_WRAP_LINES_CAP)
@@ -428,8 +551,10 @@ def reinsert_page(fitz_page, page_json):
     Mutates fitz_page in place; page_json's text_boxes must already carry
     pipeline.translated_text (i.e. classify_translate.py has run).
     """
-    for text_box in page_json["text_boxes"]:
-        refit_span(text_box)
+    text_boxes = page_json["text_boxes"]
+    page_width = page_json["width"]
+    for text_box in text_boxes:
+        refit_span(text_box, text_boxes, page_width)
 
     # Redact every span, not just translated ones -- a code/number span
     # still needs its original glyphs wiped before the identical text is
@@ -448,7 +573,6 @@ def reinsert_page(fitz_page, page_json):
     # never supposed to be touched by this pipeline at all.
     fitz_page.apply_redactions(images=0)
 
-    text_boxes = page_json["text_boxes"]
     for text_box in text_boxes:
         next_line_gap = (
             _next_line_gap(text_box, text_boxes) if text_box["pipeline"]["overflow"] else None
