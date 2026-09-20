@@ -144,6 +144,18 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
     diagram occupying the loosened space — `_LOOSE_WIDTH_MULTIPLIER`
     exists specifically to bound that risk rather than trusting an empty
     neighbor check all the way to the page edge.
+  - OCR-sourced spans (see ocr_vision.py) painted their erasure rect at
+    exactly the Vision-reported word bbox, with no padding — unlike a
+    PyMuPDF vector span's bbox (a font-metric box with real ascent/
+    descent margin), Vision's word boxes are tight around that word's
+    own visible ink only. Root-caused visually against a real synthetic
+    flattened-page render (zoomed screenshot, not guessed): a faint
+    sliver of the original image's text was still visible just outside
+    the erased rect, between two lines only ~2.7pt apart in the real
+    sample data. Fixed with a small fixed padding
+    (`_OCR_ERASE_PADDING`) added to the erasure rect only (never to the
+    text_box's own bbox used for positioning/fit) — confirmed by
+    re-rendering the same zoomed region and comparing before/after.
 """
 
 import base64
@@ -172,6 +184,19 @@ _LOOSE_PAGE_MARGIN = 24.0
 # _DEEP_SHRINK_FLOOR_RATIO's comment) without unconditionally trusting
 # "no text neighbor" all the way to the page edge.
 _LOOSE_WIDTH_MULTIPLIER = 3.0
+
+# Extra margin added to an OCR-sourced span's erasure rect (never to its
+# actual bbox used for positioning/fit) beyond Vision's own bounding box,
+# in every direction. Root-caused visually against a real synthetic
+# flattened-page render: Vision's word boxes are tight around visible ink
+# for THAT word, not a font-metric box with full ascent/descent margin
+# the way PyMuPDF's vector-span bboxes are -- a neighboring line's
+# descender (or just image/PNG compositing softness at the boundary) can
+# leave a faint sliver of the original visible just outside the tight
+# box. 0.75pt comfortably fits within the tightest real line-to-line gap
+# found in the sample Tools list (~2.7pt between consecutive 20pt items)
+# without the erasure rects of adjacent lines touching each other.
+_OCR_ERASE_PADDING = 0.75
 
 # CLAUDE.md: "Shrink font down to a floor (~75-80% of original) before
 # flagging for human review."
@@ -556,11 +581,19 @@ def reinsert_page(fitz_page, page_json):
     for text_box in text_boxes:
         refit_span(text_box, text_boxes, page_width)
 
-    # Redact every span, not just translated ones -- a code/number span
-    # still needs its original glyphs wiped before the identical text is
-    # redrawn at the (possibly refit) size, so the whole page uses one
+    # Redact every VECTOR span, not just translated ones -- a code/number
+    # span still needs its original glyphs wiped before the identical text
+    # is redrawn at the (possibly refit) size, so the whole page uses one
     # consistent rendering pass rather than mixing original and new text.
-    for text_box in page_json["text_boxes"]:
+    # OCR-sourced spans (see ocr_vision.py) are handled separately below:
+    # a flattened/rasterized page has no underlying vector text at all --
+    # the whole page IS the image, with the original English baked into
+    # its pixels -- so there's nothing for a redaction annotation to
+    # remove. "Erasing" it means painting directly over those pixels.
+    vector_boxes = [tb for tb in text_boxes if tb.get("source", "vector") != "ocr"]
+    ocr_boxes = [tb for tb in text_boxes if tb.get("source") == "ocr"]
+
+    for text_box in vector_boxes:
         fitz_page.add_redact_annot(
             pymupdf.Rect(text_box["bbox"]), fill=(1, 1, 1), cross_out=False
         )
@@ -570,8 +603,17 @@ def reinsert_page(fitz_page, page_json):
     # default images=2 "blank out overlapping image parts" was leaving a
     # visible boundary artifact wherever that happened -- a border baked
     # onto the page exactly at the diagram image's edge). Diagrams are
-    # never supposed to be touched by this pipeline at all.
+    # never supposed to be touched by this pipeline at all -- this
+    # `images=0` rule is specifically about VECTOR pages with a separate
+    # diagram image alongside real text; it doesn't apply to ocr_boxes
+    # below, where painting over the page's own image IS the point.
     fitz_page.apply_redactions(images=0)
+
+    for text_box in ocr_boxes:
+        erase_rect = pymupdf.Rect(text_box["bbox"]) + (
+            -_OCR_ERASE_PADDING, -_OCR_ERASE_PADDING, _OCR_ERASE_PADDING, _OCR_ERASE_PADDING
+        )
+        fitz_page.draw_rect(erase_rect, fill=(1, 1, 1), color=None)
 
     for text_box in text_boxes:
         next_line_gap = (

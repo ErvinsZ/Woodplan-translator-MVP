@@ -307,8 +307,14 @@ pixels**. This means:
   7 section above for how pooled/direct are distinguished on this
   project's actual provider (Neon, hostname-based) — plus NextAuth +
   Google OAuth (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/
-  `NEXTAUTH_URL`) + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY`. All must also be
-  set in Vercel's project environment variables for deploys — see the
+  `NEXTAUTH_URL`) + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` +
+  `GOOGLE_VISION_API_KEY` (Cloud Vision REST API, plain API key restricted
+  to that one API in Google Cloud Console — not a service-account/OAuth2
+  flow, see `api/ocr_vision.py`'s own docstring for why: that path needs a
+  crypto library to sign JWTs, and `cryptography`'s compiled extension is
+  exactly the class of dependency that already broke real Vercel Python
+  deployments once, see the native-extension section below). All must also
+  be set in Vercel's project environment variables for deploys — see the
   Vercel env var subsection below for two non-obvious ways to get that
   wrong.
 
@@ -468,6 +474,34 @@ pixels**. This means:
   `npm run dev:full` — clear `.vercel/cache` and `api/__pycache__` first,
   or `vercel dev` will silently keep serving the previous build and hide
   the problem.
+
+### Python multi-file imports on Vercel (sibling imports + circular imports)
+- **Every `api/*.py` file that imports a sibling module (`from foo import
+  bar`, where `foo` is another file in `api/`) needs this exact line near
+  the top, before that import:**
+  ```python
+  sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+  ```
+  Vercel loads each function's entrypoint via `importlib.exec_module`, not
+  by running it as a script, which does NOT add the script's own directory
+  to `sys.path` the way `python file.py` would. Without this line, a
+  sibling import that works fine in any local hand-rolled test harness
+  (because you control `sys.path` yourself there) fails with
+  `ModuleNotFoundError` on real `vercel dev`/production, silently. This
+  has already bitten this project more than once — remember it manually
+  for every new `api/*.py` file, there's no lint rule catching it.
+- **Two modules that need to import from EACH OTHER (A needs something
+  from B, B needs something from A) will circular-import** — fragile at
+  best, and this project's Vercel-specific `importlib`-based loading
+  makes it a real, not just theoretical, risk on top of that. Hit this
+  building `api/ocr_vision.py`: it needed `extract.py`'s rotation-angle
+  math, but `extract.py` also needed to import `ocr_vision.py` (to call
+  it as the flattened-page fallback from `extract_document`). Fixed by
+  pulling the shared piece (`rotation_angle`) out into its own
+  dependency-free module (`api/geometry.py`) that BOTH import, so neither
+  imports the other. When two sibling `api/*.py` modules seem to need
+  each other, that's the sign to extract the shared piece into a third,
+  lower-level module rather than importing across them directly.
 
 ---
 

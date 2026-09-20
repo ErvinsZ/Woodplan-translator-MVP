@@ -1,12 +1,18 @@
 # Project State
 
-Last updated: 2026-09-20, after Google Drive autosave (PR #8, merged to
-`dev`) was confirmed working end-to-end by the user (sign in, toggle on,
+Last updated: 2026-09-20, after building a Google Vision OCR fallback
+extraction path for flattened/rasterized pages
+(`feature/ocr-fallback`, branched off `dev` — code complete, thoroughly
+verified against real geometry via mocked Vision responses since there's
+no real API key configured yet, NOT tested against the real Vision API)
+— see §5/§6/§7. Previous entries: the font-size-consistency fix (PR
+#10, merged to `dev` and `main`); Google Drive autosave (PR #8, merged
+to `dev`) confirmed working end-to-end by the user (sign in, toggle on,
 translate, file landed in Drive), while the OAuth consent screen is
-still in Google's Testing status. User is now working through Google's
-publishing/verification flow (submitted the new `/privacy` page's URL)
-to open the feature up beyond the developer's own account — see §5/§6.
-Previous entries: `dev` merged to `main`, deployed to a real Production
+still in Google's Testing status and the user is working through
+Google's publishing/verification flow to open it up beyond the
+developer's own account.
+Before that: `dev` merged to `main`, deployed to a real Production
 environment, Vercel's SSO deployment protection (which was blocking
 Production entirely) resolved, Google sign-in confirmed working
 end-to-end on Production/`dev` Preview/`localhost:3000`.
@@ -48,7 +54,45 @@ translators that don't understand dimensioned technical drawings.
   `extract_page(page, page_index)`, `extract_document(pdf_bytes_or_path, name)`,
   plus an HTTP `handler` class (POST raw PDF or `{pdf_base64, page_index}` JSON,
   returns extracted JSON). Defines the core JSON schema every later stage reads/
-  writes (see `pipeline` sub-object below).
+  writes (see `pipeline` sub-object below). Every text_box now also carries
+  `"source": "vector"` or `"source": "ocr"` (see below). `extract_document`
+  falls back to `ocr_vision.py` for any page with zero real vector text
+  boxes -- a flattened/rasterized page (scan, or a plan exported to one
+  page-covering image), per CLAUDE.md's original architecture note. An
+  OCR failure (no API key, Vision error) just leaves that page with zero
+  text boxes, same as if the fallback didn't exist.
+- `api/geometry.py` — `rotation_angle(line_dir)`, split out of extract.py
+  into its own dependency-free module specifically so `ocr_vision.py` can
+  use the exact same angle math without a circular import (`extract.py`
+  needs to import `ocr_vision.py` for the fallback above; `ocr_vision.py`
+  needed the same rotation calculation extract.py already had).
+- `api/ocr_vision.py` — Google Cloud Vision `DOCUMENT_TEXT_DETECTION`
+  fallback extractor, called by `extract_document` for a flattened page.
+  Renders the page to an image (`page.get_pixmap`), POSTs it to Vision's
+  REST API via a plain API key (`GOOGLE_VISION_API_KEY`) + `urllib` --
+  deliberately NOT a service-account/OAuth2 flow, which would need a
+  crypto library to sign JWTs (PyJWT/cryptography or google-auth's own
+  dependency chain) -- `cryptography` ships a compiled Rust extension,
+  exactly the class of dependency that already crashed real Vercel
+  Python deployments once this project (`google-genai`, `psycopg
+  [binary]` -- see §4). Reconstructs one text_box per VISUAL LINE from
+  Vision's word/symbol hierarchy (Vision has no explicit line grouping,
+  only a break-type hint -- SPACE/EOL_SURE_SPACE/LINE_BREAK/HYPHEN -- on
+  each word's last symbol), converts pixel coordinates back to PDF
+  points, and estimates a font size from word-box height (Vision gives
+  no font size, there's no real original font to match here anyway).
+  Every emitted text_box carries `"source": "ocr"`.
+  - **A real bug was caught by the module's own mocked-response tests,
+    not left in**: the rotation-angle calculation originally used
+    `dx or 1` as a defensive fallback for a degenerate zero-vector case
+    that doesn't actually exist (`atan2(0, 0)` returns `0.0` natively,
+    no guard needed) -- since `0` is falsy in Python, `dx or 1` silently
+    forced `dx` to `1` whenever the TRUE dx was legitimately `0`, which
+    is exactly the correct value for genuinely vertical (90-degree)
+    text. Caught immediately by a mocked-vertical-text test expecting
+    exactly `-90.0` and getting `-89.4` instead; fixed by only
+    substituting the `(1, 0)` fallback when both dx AND dy are zero
+    (a truly degenerate same-point box), not whenever dx alone is zero.
 - `api/classify_translate.py` — consumes extract.py's JSON, classifies each
   text box (`code` / `glossary_match` / `mixed` / `llm_match` / `unmatched`)
   and fills in `pipeline.translated_text` + `needs_review`. Tiers, in order:
@@ -100,6 +144,17 @@ translators that don't understand dimensioned technical drawings.
 - `api/reinsert.py` — refit (font-shrink toward 75% floor), redact original
   text, reinsert translated/unchanged text at exact baseline origin. Handles
   arbitrary rotation angles via `morph=` matrix (not just axis-aligned).
+  Branches per span on `source`: a `"vector"` span goes through the
+  normal redaction-annotation erase (`images=0`, never touches image
+  content); an `"ocr"` span (see `ocr_vision.py`) has no underlying
+  vector text to redact at all -- the whole page IS the image, with the
+  original English baked into its pixels -- so erasing means painting a
+  white rectangle directly over Vision's word bbox instead, padded by a
+  small fixed margin (`_OCR_ERASE_PADDING`) since Vision's boxes are
+  tight around that word's own ink, not a font-metric box with real
+  ascent/descent margin the way a vector span's bbox is; found visually
+  (a faint sliver of original text between two closely-spaced lines in a
+  real synthetic-flattened-page render) before it shipped.
 - `api/translate.py` — the only endpoint the frontend calls. Orchestrates the
   three stages above in one invocation (no internal HTTP hop). Downloads
   source PDF from a Blob URL, runs the pipeline, uploads result to Blob,
@@ -645,10 +700,49 @@ translators that don't understand dimensioned technical drawings.
   diagram-adjacent pages (rendered to PNG and visually checked); 218
   real spans with a genuine same-line neighbor confirmed to get the
   exact prior tight behavior, unchanged.
-  - Not yet committed — sitting on `dev`'s working tree as of this
-    entry, user should review before it's committed/pushed.
+  - Committed, pushed, merged to `dev` and then `main` (PR #10) —
+    confirmed `READY`/`target: "production"` via the Vercel API.
+- Google Vision OCR fallback extraction built on `feature/ocr-fallback`
+  (branched off `dev`): flatness detection in `extract.py`, the new
+  `ocr_vision.py`/`geometry.py` modules, and the OCR-erasure branch in
+  `reinsert.py` -- see §2's architecture entries above for each piece's
+  own writeup, including the two real bugs caught before shipping (the
+  `dx or 1` rotation bug, the erasure-padding sliver).
+  - **Verified against real geometry via mocked Vision responses, NOT
+    against the real Vision API** -- no `GOOGLE_VISION_API_KEY` is
+    configured yet (see §6). Built a synthetic flattened test fixture
+    (rendered `sample_plan.pdf`'s real Tools-checklist page to a plain
+    image with zero vector text, confirmed via `extract_page` directly)
+    and a mocked Vision response using every real span's ACTUAL bbox
+    coordinates from that same page, not invented numbers -- the full
+    flatness-detection -> OCR -> classify/translate (real glossary,
+    real German output) -> reinsert -> render pipeline ran end to end
+    and was visually inspected (zoomed screenshots, not just pixel
+    counts) at each stage, including after the erasure-padding fix.
+    This proves the SCHEMA MAPPING, COORDINATE MATH, and REINSERTION
+    PATH are correct; it does NOT prove the real Vision REST contract
+    (auth, response shape for actual scanned content, real-world OCR
+    accuracy) works, since no real network call has been made yet.
+  - Not committed yet — new code the user should review before it's
+    pushed.
 
 ## 6. What's in progress
+
+`feature/ocr-fallback`'s code is done and structurally verified (§5), but
+has **one required manual step, not done yet, blocking the first real
+test**: a `GOOGLE_VISION_API_KEY`. Same shape of task as the Drive API
+step earlier this project -- in Google Cloud Console: enable the
+**Cloud Vision API** (APIs & Services -> Library), then create an API
+key (APIs & Services -> Credentials -> Create Credentials -> API Key),
+restricted to the Cloud Vision API only. Once that exists (in
+`.env.local` and Vercel's env vars, same pattern as `GEMINI_API_KEY`),
+the real end-to-end test still needs to happen: run the pipeline against
+a genuinely flattened/scanned real plan PDF (not yet on hand -- the
+synthetic fixture used for verification so far is a real page's real
+text re-rendered as an image, which is enough to prove the schema
+mapping and coordinate math but not real-world OCR accuracy against an
+actual scan) and confirm the output looks right by eye, the way every
+other feature in this project has been checked.
 
 User is now working through Google's publishing/verification flow to
 move the OAuth consent screen out of Testing status (submitting the new
@@ -689,6 +783,25 @@ The natural next slice, per CLAUDE.md's suggested branch order:
 
 ## 7. Known issues / TODOs
 
+- **Google Vision OCR fallback is not rate-limited or cost-tracked at
+  all** — unlike everything else in this stack (Neon's hard-capped free
+  tier, Gemini's in-process rate limiting per CLAUDE.md's own deliberate
+  design), Cloud Vision's `DOCUMENT_TEXT_DETECTION` has a real, fairly
+  modest free tier (historically ~1000 units/month, 1 page = 1 unit,
+  then billed per request past that) and this pipeline will call it once
+  per flattened page with zero guardrails — a handful of multi-page
+  flattened documents could exhaust the free tier in one afternoon. Not
+  addressed this session (out of scope for "implement the fallback" as
+  asked) — worth a usage counter or a hard per-document page cap before
+  this sees real, unsupervised traffic.
+- **No real flattened/scanned test PDF exists yet** — verification so
+  far used a synthetic fixture (a real page re-rendered as one image)
+  plus a mocked Vision response built from that same page's real
+  extracted coordinates. This proves the code's own logic is correct but
+  has never seen genuine OCR noise (misreads, skewed scan angles, a real
+  scanner's actual DPI/compression artifacts) or a real Vision API
+  response's exact shape. Get one real flattened plan PDF (or scan one)
+  before trusting this against real seller uploads.
 - **Google Drive autosave now confirmed working end-to-end by the user**
   (see §5) while the OAuth consent screen is still in Google's Testing
   publishing status — Drive API enabled, `drive.file` added to the
@@ -807,14 +920,12 @@ The natural next slice, per CLAUDE.md's suggested branch order:
   cheap, separate win worth doing regardless." Output PDF is currently ~9.6%
   *larger* than input (redaction/reinsertion adds content-stream overhead
   with no offsetting image optimization).
-- **Vercel Python multi-file import gotcha is not documented anywhere except
-  this file and inline code comments.** If a fresh session adds a new
-  `api/*.py` file that imports a sibling module, it WILL silently work in any
-  local hand-rolled test harness (because you control `sys.path` yourself)
-  and WILL silently fail on real `vercel dev`/production with
-  `ModuleNotFoundError` unless the `sys.path.insert(...)` line from §2 is
-  copied into the new file too. There is no lint rule or test catching this
-  — must be remembered manually.
+- ~~Vercel Python multi-file import gotcha is not documented anywhere
+  except this file and inline code comments~~ — **fixed**: now in
+  CLAUDE.md's own "Python multi-file imports on Vercel" section, along
+  with the circular-import lesson from building `api/ocr_vision.py`/
+  `api/geometry.py`. Still no lint rule catching either case — still has
+  to be remembered manually, just no longer undocumented.
 - **Blob storage has no cleanup/lifecycle policy** beyond `translate.py`
   deleting the source upload immediately after processing (best-effort, not
   guaranteed — a mid-request crash would orphan it). Translated outputs are

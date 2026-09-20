@@ -24,34 +24,21 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
 
 import base64
 import json
-import math
+import os
+import sys
 from http.server import BaseHTTPRequestHandler
 
 import pymupdf
 
-# Below this, a line direction is treated as exactly horizontal/vertical —
-# absorbs float noise like dir=(1.0, -9.999999974752427e-07) from PyMuPDF.
-_ROTATION_EPSILON_DEGREES = 0.5
+# Vercel's Python runtime loads the entrypoint via importlib (exec_module),
+# not as a directly-run script, so this file's own directory is never
+# auto-added to sys.path the way `python extract.py` would -- sibling
+# imports (geometry.py, ocr_vision.py below) silently 404 with
+# ModuleNotFoundError without this.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-
-def _rotation_angle(line_dir):
-    """True writing-direction angle in degrees (CCW positive, 0 = horizontal).
-
-    Real plans contain diagonal callouts (e.g. "64°", "26°" angle labels
-    following a diagram's actual cut angle), not just horizontal/vertical
-    text. A binary horizontal-vs-vertical model silently flattens those to
-    0 degrees and loses the data needed to place them correctly on
-    reinsertion — which itself must use a rotation matrix (`morph=`) for
-    any non-multiple-of-90 angle, since `insert_text(rotate=...)` only
-    accepts 0/90/180/270.
-    """
-    dx, dy = line_dir
-    angle = math.degrees(math.atan2(-dy, dx))
-    if abs(angle) < _ROTATION_EPSILON_DEGREES:
-        return 0.0
-    if abs(abs(angle) - 90) < _ROTATION_EPSILON_DEGREES:
-        return 90.0 if angle > 0 else -90.0
-    return round(angle, 3)
+from geometry import rotation_angle as _rotation_angle
+from ocr_vision import ocr_page
 
 
 def extract_page(page, page_index):
@@ -89,6 +76,14 @@ def extract_page(page, page_index):
                     "line_dir": list(line_dir),
                     "is_rotated": is_rotated,
                     "rotation_angle": rotation_angle,
+                    # "vector" (real PyMuPDF text) vs "ocr" (see
+                    # ocr_vision.py, used by extract_document below for a
+                    # flattened/rasterized page with no real text at all).
+                    # reinsert.py branches on this: an OCR span has no
+                    # underlying vector text to redact, so erasing the
+                    # original means painting over image pixels directly
+                    # instead of the normal redaction-annotation path.
+                    "source": "vector",
                     # Filled in by classify_translate.py; kept here so the
                     # shape is stable end-to-end (mirrors the text_boxes
                     # JSONB column: extraction owns the structural fields,
@@ -113,13 +108,38 @@ def extract_page(page, page_index):
 
 
 def extract_document(pdf_stream_or_path, document_name=None):
-    """Extract all pages of a PDF into the JSON schema."""
+    """Extract all pages of a PDF into the JSON schema.
+
+    A page with zero real vector text boxes is a flattened/rasterized
+    page (a scan, or a plan exported to one page-covering image) rather
+    than a page that's legitimately just sparse -- every real page found
+    in this project's sample data carries at minimum a repeated copyright
+    footer as real vector text, so genuine zero-text pages aren't expected
+    outside this case. Falls back to OCR (see ocr_vision.py) for exactly
+    those pages, per CLAUDE.md's original architecture note; every other
+    page keeps normal vector extraction untouched. An OCR failure (no
+    GOOGLE_VISION_API_KEY configured, Vision API error) is caught and
+    leaves that page with zero text boxes, same as if this fallback
+    didn't exist -- it only ever adds coverage, never removes it.
+    """
     if isinstance(pdf_stream_or_path, (bytes, bytearray)):
         doc = pymupdf.open(stream=pdf_stream_or_path, filetype="pdf")
     else:
         doc = pymupdf.open(pdf_stream_or_path)
     try:
-        pages = [extract_page(doc[i], i) for i in range(doc.page_count)]
+        pages = []
+        for i in range(doc.page_count):
+            page = extract_page(doc[i], i)
+            if not page["text_boxes"]:
+                try:
+                    page = ocr_page(doc[i], i)
+                except Exception as exc:
+                    print(
+                        f"extract_document: OCR fallback failed on page {i} ({exc!r}), "
+                        "leaving it with zero text boxes",
+                        file=sys.stderr,
+                    )
+            pages.append(page)
     finally:
         doc.close()
 
@@ -154,20 +174,27 @@ class handler(BaseHTTPRequestHandler):
         else:
             pdf_bytes = body
 
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            if page_index is not None:
+        if page_index is not None:
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            try:
                 result = extract_page(doc[page_index], page_index)
+                if not result["text_boxes"]:
+                    try:
+                        result = ocr_page(doc[page_index], page_index)
+                    except Exception as exc:
+                        print(
+                            f"extract handler: OCR fallback failed on page "
+                            f"{page_index} ({exc!r}), leaving it with zero text boxes",
+                            file=sys.stderr,
+                        )
                 result["document"] = document_name or "unknown.pdf"
-            else:
-                pages = [extract_page(doc[i], i) for i in range(doc.page_count)]
-                result = {
-                    "document": document_name or "unknown.pdf",
-                    "page_count": len(pages),
-                    "pages": pages,
-                }
-        finally:
-            doc.close()
+            finally:
+                doc.close()
+        else:
+            # extract_document already includes the same OCR fallback and
+            # manages its own doc open/close -- no need to duplicate that
+            # loop here.
+            result = extract_document(pdf_bytes, document_name)
 
         response = json.dumps(result).encode("utf-8")
         self.send_response(200)
