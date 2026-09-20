@@ -372,14 +372,28 @@ pixels**. This means:
   Protection settings** (SSO/password/trusted-IPs) — use the Vercel MCP
   tool's `get_project` (or the dashboard) instead; it returns
   `ssoProtection`/`passwordProtection`/`trustedIps` fields the CLI
-  output omits entirely. This project has
-  `ssoProtection.enabled: true, deploymentType:
-  "all_except_custom_domains"` — since there's no custom domain
-  attached, this gates every `*.vercel.app` URL for this project,
-  **Production included**, behind Vercel's own login page for anyone
-  without team access. A session-less automated browser (no Vercel
-  login) hits this wall before ever reaching the app — don't mistake
-  that for an application bug when testing headlessly.
+  output omits entirely. A session-less automated browser (no Vercel
+  login) hits Vercel's own login wall before ever reaching the app when
+  `ssoProtection` is enabled for the environment being tested — don't
+  mistake that for an application bug when testing headlessly.
+- **The Vercel MCP tool's `update_project` refuses to change a setting
+  that weakens security** (e.g. `ssoProtection` -> a less-protected
+  value) — this environment's own safety layer blocks that specific
+  call, separate from Vercel's API itself. Don't retry it or try to
+  route around it (e.g. raw `curl` with a token); it's asking for that
+  one change to go through the user directly instead. Hand them the
+  exact dashboard path (Project Settings -> Deployment Protection ->
+  Vercel Authentication) and the exact value to pick.
+- **`ssoProtection.deploymentType` has a `"preview"` option** that
+  protects Preview deployments only and leaves Production open —
+  discovered via the `update_project` MCP tool's own request schema, not
+  the docs. This does NOT require a custom domain, unlike
+  `"all_except_custom_domains"` (which excludes custom-domain traffic
+  from protection but still gates the default `.vercel.app` Production
+  URL if no custom domain is attached). Prefer `"preview"` over fully
+  disabling `ssoProtection` when the goal is just "make Production
+  public, keep Preview gated" — fully disabling also exposes Preview
+  deployments, which is a real side effect if that wasn't the intent.
 
 ### Prisma client generation on Vercel
 - `app/generated/prisma` (the generated Prisma Client — see the Prisma 7
