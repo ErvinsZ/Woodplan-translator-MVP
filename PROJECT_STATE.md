@@ -1,11 +1,13 @@
 # Project State
 
-Last updated: 2026-09-20, after building a Google Vision OCR fallback
-extraction path for flattened/rasterized pages
-(`feature/ocr-fallback`, branched off `dev` — code complete, thoroughly
-verified against real geometry via mocked Vision responses since there's
-no real API key configured yet, NOT tested against the real Vision API)
-— see §5/§6/§7. Previous entries: the font-size-consistency fix (PR
+Last updated: 2026-09-20, after verifying the Google Vision OCR fallback
+(`feature/ocr-fallback`, branched off `dev`) against the REAL Vision
+API — the user provided `GOOGLE_VISION_API_KEY`, which surfaced two real
+bugs no amount of mocked-response testing could have caught (an 8x-too-
+tight rotation epsilon for Vision's noisier detected geometry, and
+under-tuned erasure padding), both found by zooming into real rendered
+output and both fixed. Not yet committed — see §5/§6/§7. Previous
+entries: the font-size-consistency fix (PR
 #10, merged to `dev` and `main`); Google Drive autosave (PR #8, merged
 to `dev`) confirmed working end-to-end by the user (sign in, toggle on,
 translate, file landed in Drive), while the OAuth consent screen is
@@ -706,43 +708,63 @@ translators that don't understand dimensioned technical drawings.
   (branched off `dev`): flatness detection in `extract.py`, the new
   `ocr_vision.py`/`geometry.py` modules, and the OCR-erasure branch in
   `reinsert.py` -- see §2's architecture entries above for each piece's
-  own writeup, including the two real bugs caught before shipping (the
-  `dx or 1` rotation bug, the erasure-padding sliver).
-  - **Verified against real geometry via mocked Vision responses, NOT
-    against the real Vision API** -- no `GOOGLE_VISION_API_KEY` is
-    configured yet (see §6). Built a synthetic flattened test fixture
-    (rendered `sample_plan.pdf`'s real Tools-checklist page to a plain
-    image with zero vector text, confirmed via `extract_page` directly)
-    and a mocked Vision response using every real span's ACTUAL bbox
-    coordinates from that same page, not invented numbers -- the full
-    flatness-detection -> OCR -> classify/translate (real glossary,
-    real German output) -> reinsert -> render pipeline ran end to end
-    and was visually inspected (zoomed screenshots, not just pixel
-    counts) at each stage, including after the erasure-padding fix.
-    This proves the SCHEMA MAPPING, COORDINATE MATH, and REINSERTION
-    PATH are correct; it does NOT prove the real Vision REST contract
-    (auth, response shape for actual scanned content, real-world OCR
-    accuracy) works, since no real network call has been made yet.
-  - Not committed yet — new code the user should review before it's
-    pushed.
+  own writeup.
+  - **Verified against the REAL Vision API, not just mocked responses**
+    -- the user provided `GOOGLE_VISION_API_KEY` (after first creating a
+    service-account key by mistake; talked through why that specific
+    credential type was avoided on purpose -- it needs JWT signing,
+    which needs a compiled crypto library, exactly the risk this whole
+    module was designed to route around). Ran the full
+    flatness-detection -> real Vision OCR call -> classify/translate
+    (real glossary + Gemini, real German output) -> reinsert -> render
+    pipeline against the real synthetic flattened Tools-checklist page,
+    end to end, more than once as bugs were found and fixed.
+  - **Two more real bugs found from the REAL Vision response that the
+    earlier mocked tests could not have caught, since they were built
+    from idealized geometry**:
+    1. Vision's real word bounding boxes carry several degrees of
+       detection jitter even for genuinely horizontal text (confirmed
+       directly: up to 6.34° on an entirely horizontal real page) --
+       the original 0.5° rotation epsilon (tuned for PyMuPDF's
+       mathematically-exact vector line directions) flagged roughly a
+       third of that page's real OCR lines as `is_rotated: True` purely
+       from noise, which matters because reinsert.py's rotated-text path
+       skips the entire overflow/shrink system. Fixed by giving
+       `geometry.rotation_angle` a configurable epsilon
+       (`_OCR_ROTATION_EPSILON_DEGREES = 8.0` in `ocr_vision.py`,
+       comfortably above the observed noise, still well below any real
+       diagram angle-callout seen in vector data so far) rather than
+       widening the shared default used by the precise vector path too.
+    2. The erasure padding (`_OCR_ERASE_PADDING`), tuned to 0.75pt
+       against a synthetic test using a real vector span's own already-
+       generous bbox, was too optimistic for Vision's real (tighter)
+       boxes -- found by zooming into the real rendered output at each
+       step: a sliver of "Tools:" was still visible above its reported
+       top edge at 0.75pt; a "p" descender (from "Tips" in "Safety
+       Tips :") was still visible below its reported bottom edge even
+       at 3.0pt. Settled on 5.0pt after re-verifying the exact same
+       regions clean at each step -- see `reinsert.py`'s own comment for
+       the full before/after.
+  - Not yet committed as of the real-API verification pass — see §6.
 
 ## 6. What's in progress
 
-`feature/ocr-fallback`'s code is done and structurally verified (§5), but
-has **one required manual step, not done yet, blocking the first real
-test**: a `GOOGLE_VISION_API_KEY`. Same shape of task as the Drive API
-step earlier this project -- in Google Cloud Console: enable the
-**Cloud Vision API** (APIs & Services -> Library), then create an API
-key (APIs & Services -> Credentials -> Create Credentials -> API Key),
-restricted to the Cloud Vision API only. Once that exists (in
-`.env.local` and Vercel's env vars, same pattern as `GEMINI_API_KEY`),
-the real end-to-end test still needs to happen: run the pipeline against
-a genuinely flattened/scanned real plan PDF (not yet on hand -- the
-synthetic fixture used for verification so far is a real page's real
-text re-rendered as an image, which is enough to prove the schema
-mapping and coordinate math but not real-world OCR accuracy against an
-actual scan) and confirm the output looks right by eye, the way every
-other feature in this project has been checked.
+`feature/ocr-fallback`'s code is done and verified against the real
+Vision API (§5) -- `GOOGLE_VISION_API_KEY` is live in `.env.local`
+(Vercel env vars not yet provisioned, see §7). Not committed yet; the
+user should review the two real fixes from the real-API pass (§5)
+before it's pushed.
+
+Still open: **no genuinely flattened/scanned real plan PDF has been
+tested** -- every real-API run so far used the same synthetic fixture
+(a real page's real vector text re-rendered as one image), which
+exercises the real Vision REST contract and real OCR-detection geometry
+but not a real scanner's actual artifacts (skew, noise, compression).
+Worth running against one real flattened seller PDF before trusting
+this against real uploads.
+
+User is now working through Google's publishing/verification flow to
+move the OAuth consent screen out of Testing status (submitting the new
 
 User is now working through Google's publishing/verification flow to
 move the OAuth consent screen out of Testing status (submitting the new
@@ -794,14 +816,20 @@ The natural next slice, per CLAUDE.md's suggested branch order:
   addressed this session (out of scope for "implement the fallback" as
   asked) — worth a usage counter or a hard per-document page cap before
   this sees real, unsupervised traffic.
-- **No real flattened/scanned test PDF exists yet** — verification so
-  far used a synthetic fixture (a real page re-rendered as one image)
-  plus a mocked Vision response built from that same page's real
-  extracted coordinates. This proves the code's own logic is correct but
-  has never seen genuine OCR noise (misreads, skewed scan angles, a real
-  scanner's actual DPI/compression artifacts) or a real Vision API
-  response's exact shape. Get one real flattened plan PDF (or scan one)
-  before trusting this against real seller uploads.
+- **`GOOGLE_VISION_API_KEY` is only confirmed present in `.env.local`** —
+  not yet provisioned in Vercel's actual project environment variables
+  (Production/Preview/Development), same category of gap as every other
+  API key was at some point before deploy. Add it via `vercel env add`
+  before merging this branch, or the real Vision call will fail on any
+  deployed environment even though it works locally.
+- **No real flattened/scanned test PDF exists yet** — the real-API
+  verification so far (§5) used a synthetic fixture (a real page's real
+  vector text re-rendered as one image). This exercises the real Vision
+  REST contract and real OCR-detection geometry, which is what surfaced
+  both real bugs fixed this pass — but it has never seen genuine scanner
+  artifacts (skewed pages, real noise/compression, actual misreads on
+  unfamiliar handwriting-adjacent fonts). Get one real flattened plan
+  PDF (or scan one) before trusting this against real seller uploads.
 - **Google Drive autosave now confirmed working end-to-end by the user**
   (see §5) while the OAuth consent screen is still in Google's Testing
   publishing status — Drive API enabled, `drive.file` added to the

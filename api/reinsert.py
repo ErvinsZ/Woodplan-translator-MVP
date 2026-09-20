@@ -187,16 +187,22 @@ _LOOSE_WIDTH_MULTIPLIER = 3.0
 
 # Extra margin added to an OCR-sourced span's erasure rect (never to its
 # actual bbox used for positioning/fit) beyond Vision's own bounding box,
-# in every direction. Root-caused visually against a real synthetic
-# flattened-page render: Vision's word boxes are tight around visible ink
+# in every direction. Vision's word boxes are tight around visible ink
 # for THAT word, not a font-metric box with full ascent/descent margin
-# the way PyMuPDF's vector-span bboxes are -- a neighboring line's
-# descender (or just image/PNG compositing softness at the boundary) can
-# leave a faint sliver of the original visible just outside the tight
-# box. 0.75pt comfortably fits within the tightest real line-to-line gap
-# found in the sample Tools list (~2.7pt between consecutive 20pt items)
-# without the erasure rects of adjacent lines touching each other.
-_OCR_ERASE_PADDING = 0.75
+# the way PyMuPDF's vector-span bboxes are, so real ink can extend
+# slightly past the reported box. Tuned in two passes against a REAL
+# Vision API response on a real rendered page (a synthetic test using a
+# vector span's own generous bbox was too optimistic and missed this
+# entirely): 0.75pt still left visible fragments (e.g. a sliver of
+# "Tools:" above "Tools :"'s reported top edge); 3.0pt fixed every case
+# checked there but still missed a "p" descender (from "Tips" in "Safety
+# Tips :") by roughly 1.75pt on a different line. 5.0pt cleared that
+# too. Adjacent erasure rects can end up overlapping each other at this
+# size (real line-to-line gaps in the sample data run as tight as
+# ~2.7pt) -- harmless, since every OCR span's erasure happens in its own
+# pass BEFORE any span's translated text is drawn (see reinsert_page),
+# so there's never anything to accidentally paint over yet.
+_OCR_ERASE_PADDING = 5.0
 
 # CLAUDE.md: "Shrink font down to a floor (~75-80% of original) before
 # flagging for human review."

@@ -71,6 +71,21 @@ _NO_SPACE_BREAKS = {"HYPHEN"}
 # original (there is no original font here to match, unlike vector spans).
 _HEIGHT_TO_FONT_SIZE_RATIO = 0.75
 
+# geometry.rotation_angle's tolerance for "close enough to horizontal/
+# vertical to snap to exactly 0/90" -- much wider than the 0.5-degree
+# default, which is tuned for PyMuPDF's mathematically-exact vector line
+# directions. Vision's word bounding boxes are fitted around detected
+# ink, not font metrics, and a real API response against a real,
+# entirely-horizontal page showed up to 6.34 degrees of pure detection
+# jitter (confirmed directly, not estimated) -- without a wider
+# tolerance here, a third of that real page's lines got flagged
+# `is_rotated: True` from noise alone, which matters a lot downstream:
+# reinsert.py's rotated-text path skips the entire overflow/shrink
+# system. 8.0 clears that observed noise ceiling with real margin while
+# staying well below any genuine diagram angle-callout seen so far in
+# real vector data (26/45/64/90 degrees).
+_OCR_ROTATION_EPSILON_DEGREES = 8.0
+
 
 class _VisionError(Exception):
     def __init__(self, code, message):
@@ -192,7 +207,7 @@ def _line_to_text_box(page_index, line_no, text, vertices):
         line_dir = (dx, dy)
     else:
         line_dir = (1, 0)
-    rotation_angle = _rotation_angle(line_dir)
+    rotation_angle = _rotation_angle(line_dir, _OCR_ROTATION_EPSILON_DEGREES)
 
     return {
         "id": f"p{page_index}-ocr-l{line_no}",
