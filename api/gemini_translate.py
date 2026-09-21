@@ -116,10 +116,12 @@ def _system_instruction(target_lang):
         "short, technical, and instructional, matching printed plan "
         'conventions (imperative sentences, headings like "Cutout List" '
         'or "Top view").\n\n'
-        "Translate only the text given. Never alter, add, or remove "
-        "numbers, dimensions, or part codes (e.g. \"D1\", \"S2\", "
-        "\"3'-1 3/8\\\"\"); a wrong digit in a woodworking dimension can "
-        "cause wasted materials or a safety issue.\n\n"
+        "Translate only the text given. Numbers, dimensions and part "
+        "codes have been replaced by placeholders like ⟦0⟧, ⟦1⟧: copy "
+        "every placeholder into the translation exactly once, unchanged, "
+        "at the grammatically right position. Never add, drop, merge or "
+        "renumber placeholders, and never write digits yourself -- a "
+        "translation with altered placeholders is discarded.\n\n"
         "For consistency, these English terms already have an "
         f"established {language} translation in this project's glossary "
         "-- use the same term whenever it applies, including to "

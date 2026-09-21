@@ -38,12 +38,36 @@ import pymupdf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from geometry import rotation_angle as _rotation_angle
+from layout_units import build_units, extract_segments
 from ocr_vision import ocr_page, ocr_image_regions
 
 
+def _invisible_rects(page):
+    """Bboxes of text drawn invisibly (render mode 3, or fully transparent)
+    -- e.g. the hidden OCR text layer of a scanned PDF. Translating that
+    text and redrawing it visibly would paint a second copy over the scan."""
+    rects = []
+    try:
+        for trace in page.get_texttrace():
+            if trace.get("type") == 3 or trace.get("opacity", 1) == 0:
+                rects.append(pymupdf.Rect(trace["bbox"]))
+    except Exception:
+        pass
+    return rects
+
+
+def _mostly_inside(rect, others):
+    for other in others:
+        inter = rect & other
+        if not inter.is_empty and inter.get_area() > 0.8 * max(rect.get_area(), 1e-6):
+            return True
+    return False
+
+
 def extract_page(page, page_index):
-    """Extract every non-blank text span on one page into the JSON schema."""
+    """Extract every non-blank, visible text span on one page into the JSON schema."""
     page_dict = page.get_text("dict")
+    invisible = _invisible_rects(page)
     text_boxes = []
 
     for block_no, block in enumerate(page_dict["blocks"]):
@@ -59,6 +83,10 @@ def extract_page(page, page_index):
             for span_no, span in enumerate(line["spans"]):
                 if not span["text"].strip():
                     continue
+                if span.get("alpha", 255) == 0 or (
+                    invisible and _mostly_inside(pymupdf.Rect(span["bbox"]), invisible)
+                ):
+                    continue
 
                 text_boxes.append({
                     "id": f"p{page_index}-b{block_no}-l{line_no}-s{span_no}",
@@ -72,6 +100,8 @@ def extract_page(page, page_index):
                         "name": span["font"],
                         "size": span["size"],
                         "color": span["color"],
+                        # bit 4 = bold, bit 1 = italic (layout_units.py)
+                        "flags": span["flags"],
                     },
                     "line_dir": list(line_dir),
                     "is_rotated": is_rotated,
@@ -107,6 +137,70 @@ def extract_page(page, page_index):
     }
 
 
+# OCR lines below this Vision confidence, or shorter than this (pt), are
+# dropped -- noise, not text worth translating.
+_OCR_MIN_CONFIDENCE = 0.6
+_OCR_MIN_HEIGHT_PT = 4.0
+# An OCR line overlapping real vector text this much is the same text
+# seen twice (vector labels drawn on top of an image), not new text.
+_OCR_MAX_VECTOR_OVERLAP = 0.3
+
+
+def _overlap_frac(a, b):
+    """Intersection area / area of the smaller rect."""
+    inter = a & b
+    if inter.is_empty:
+        return 0.0
+    return inter.get_area() / max(min(a.get_area(), b.get_area()), 1e-6)
+
+
+def _keep_ocr_box(box, vector_rects):
+    r = pymupdf.Rect(box["bbox"])
+    if r.height < _OCR_MIN_HEIGHT_PT or box["ocr"]["min_conf"] < _OCR_MIN_CONFIDENCE:
+        return False
+    return not any(_overlap_frac(r, v) > _OCR_MAX_VECTOR_OVERLAP for v in vector_rects)
+
+
+def extract_page_full(doc, page_index, ocr_cache=None):
+    """extract_page + the OCR fallbacks (see extract_document) + the
+    layout data reinsert.py needs: drawn line segments and translation
+    units (layout_units.py). `ocr_cache` (a dict shared across one
+    document's pages) makes each embedded image cost one Vision call."""
+    fitz_page = doc[page_index]
+    page = extract_page(fitz_page, page_index)
+    raster_v, raster_h = [], []
+    if not page["text_boxes"]:
+        try:
+            page = ocr_page(fitz_page, page_index)
+            page["text_boxes"] = [tb for tb in page["text_boxes"] if _keep_ocr_box(tb, [])]
+        except Exception as exc:
+            print(
+                f"extract: OCR fallback failed on page {page_index} ({exc!r}), "
+                "leaving it with zero text boxes",
+                file=sys.stderr,
+            )
+    else:
+        images = fitz_page.get_image_info(xrefs=True)
+        if images:
+            try:
+                vector_rects = [pymupdf.Rect(tb["bbox"]) for tb in page["text_boxes"]]
+                boxes, raster_v, raster_h = ocr_image_regions(fitz_page, page_index, images, ocr_cache)
+                page["text_boxes"].extend(tb for tb in boxes if _keep_ocr_box(tb, vector_rects))
+            except Exception as exc:
+                print(
+                    f"extract: per-image OCR failed on page {page_index} "
+                    f"({exc!r}), leaving its embedded images untouched",
+                    file=sys.stderr,
+                )
+    vsegs, hsegs = extract_segments(fitz_page)
+    # + straight lines drawn inside OCR'd images (table rules, frames)
+    vsegs += raster_v
+    hsegs += raster_h
+    page["segments"] = {"v": vsegs, "h": hsegs}
+    page["units"] = build_units(page, vsegs)
+    return page
+
+
 def extract_document(pdf_stream_or_path, document_name=None):
     """Extract all pages of a PDF into the JSON schema.
 
@@ -138,35 +232,8 @@ def extract_document(pdf_stream_or_path, document_name=None):
     else:
         doc = pymupdf.open(pdf_stream_or_path)
     try:
-        pages = []
-        for i in range(doc.page_count):
-            page = extract_page(doc[i], i)
-            if not page["text_boxes"]:
-                try:
-                    page = ocr_page(doc[i], i)
-                except Exception as exc:
-                    print(
-                        f"extract_document: OCR fallback failed on page {i} ({exc!r}), "
-                        "leaving it with zero text boxes",
-                        file=sys.stderr,
-                    )
-            else:
-                images = [
-                    (info["bbox"], info["xref"])
-                    for info in doc[i].get_image_info(xrefs=True)
-                ]
-                if images:
-                    try:
-                        page["text_boxes"].extend(
-                            ocr_image_regions(doc[i], i, images)
-                        )
-                    except Exception as exc:
-                        print(
-                            f"extract_document: per-image OCR failed on page {i} "
-                            f"({exc!r}), leaving its embedded images untouched",
-                            file=sys.stderr,
-                        )
-            pages.append(page)
+        ocr_cache = {}
+        pages = [extract_page_full(doc, i, ocr_cache) for i in range(doc.page_count)]
     finally:
         doc.close()
 
@@ -204,32 +271,7 @@ class handler(BaseHTTPRequestHandler):
         if page_index is not None:
             doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
             try:
-                result = extract_page(doc[page_index], page_index)
-                if not result["text_boxes"]:
-                    try:
-                        result = ocr_page(doc[page_index], page_index)
-                    except Exception as exc:
-                        print(
-                            f"extract handler: OCR fallback failed on page "
-                            f"{page_index} ({exc!r}), leaving it with zero text boxes",
-                            file=sys.stderr,
-                        )
-                else:
-                    images = [
-                        (info["bbox"], info["xref"])
-                        for info in doc[page_index].get_image_info(xrefs=True)
-                    ]
-                    if images:
-                        try:
-                            result["text_boxes"].extend(
-                                ocr_image_regions(doc[page_index], page_index, images)
-                            )
-                        except Exception as exc:
-                            print(
-                                f"extract handler: per-image OCR failed on page "
-                                f"{page_index} ({exc!r}), leaving its embedded images untouched",
-                                file=sys.stderr,
-                            )
+                result = extract_page_full(doc, page_index)
                 result["document"] = document_name or "unknown.pdf"
             finally:
                 doc.close()

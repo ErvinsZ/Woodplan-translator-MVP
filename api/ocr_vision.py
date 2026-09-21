@@ -44,26 +44,32 @@ Every text_box this module emits carries `"source": "ocr"` for exactly that
 branch -- see reinsert.py's reinsert_page.
 
 Talks to the Vision REST API directly via urllib with a plain API key, not
-a service-account/OAuth2 flow -- same reasoning as gemini_translate.py's
-and blob.py's existing hand-rolled-REST pattern: a service-account JWT flow
-needs a crypto library to sign requests (PyJWT/cryptography, or
-google-auth's own dependency chain), and `cryptography` ships a compiled
-Rust extension -- exactly the class of dependency CLAUDE.md already warns
-crashes real Vercel Python deployments (`google-genai`/`psycopg[binary]`
-both did, confirmed via real `vercel dev` requests, not just a local venv).
-A plain API key sidesteps that risk entirely and matches every other
-external API call in this codebase.
+a service-account/OAuth2 flow -- same hand-rolled-REST pattern as
+gemini_translate.py and blob.py; a service-account JWT flow would need a
+crypto library just to sign requests. (It was originally avoided over
+compiled-extension crashes that turned out to be a local Python-version
+mismatch -- see CLAUDE.md -- but a plain key is still simpler.) The key
+must be in the Vercel project env, not only `.env.local`: `vercel dev`'s
+Python functions don't read `.env.local`.
+
+Besides text, this module returns what reinsert.py needs to erase it: each
+OCR line's word boxes in the source image's pixels (inpainting, see
+image_erase.py), Vision paragraph ids (layout grouping), the lowest symbol
+confidence, a baseline and a text colour measured from the pixels, and the
+straight lines drawn inside each image (`raster_segments`, layout borders).
 """
 
 import base64
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.error
 import urllib.request
 
 import certifi
+import numpy as np
 import pymupdf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,19 +89,11 @@ _RENDER_SCALE = 2.0
 
 # Break types that end a visual LINE, not just a word, within Vision's
 # word/symbol hierarchy -- see _lines_from_annotation's docstring for how
-# these drive line reconstruction.
+# these drive line reconstruction (HYPHEN also ends a line).
 _LINE_END_BREAKS = {"LINE_BREAK", "EOL_SURE_SPACE"}
-# A break after a word that should NOT get a space appended before the
-# next word on the same line (a hyphenated wrap, or no break info at all).
-_NO_SPACE_BREAKS = {"HYPHEN"}
-
-# Word bounding-box height -> estimated font point size. Vision gives pixel
-# geometry, not a font size -- this is a coarse cap-height-ish approximation
-# (a real font's point size is somewhat taller than its rendered glyph
-# bbox), not font metrics. Good enough for refit_span's shrink-to-fit
-# comparison, which only needs a reasonable STARTING size, not an exact
-# original (there is no original font here to match, unlike vector spans).
-_HEIGHT_TO_FONT_SIZE_RATIO = 0.75
+# Characters reaching below the baseline -- a word containing one has a
+# taller ink box relative to its em size (see _text_boxes_from_annotation).
+_DESCENDER_RE = re.compile(r"[gjpqyQ(),;\[\]{}|/]")
 
 # geometry.rotation_angle's tolerance for "close enough to horizontal/
 # vertical to snap to exactly 0/90" -- much wider than the 0.5-degree
@@ -180,20 +178,62 @@ def _call_vision(image_bytes):
     return result.get("fullTextAnnotation")
 
 
-def _word_text_and_break(word):
-    """Concatenates a word's symbols into text; returns (text, break_type)
-    of whatever break follows its LAST symbol, or None if unspecified."""
+def _word_info(word):
+    """(text, break_type, min_symbol_confidence, vertices) for one Vision word.
+    break_type is whatever break follows its LAST symbol, or None."""
     chars = []
     break_type = None
+    confs = []
     for symbol in word.get("symbols", []):
         chars.append(symbol.get("text", ""))
         detected = symbol.get("property", {}).get("detectedBreak")
         break_type = detected["type"] if detected else None
-    return "".join(chars), break_type
+        confs.append(symbol.get("confidence", word.get("confidence", 1.0)))
+    min_conf = min(confs) if confs else word.get("confidence", 1.0)
+    return "".join(chars), break_type, min_conf, _poly_vertices(word.get("boundingBox", {}))
 
 
 def _poly_vertices(bounding_poly):
     return bounding_poly.get("vertices") or bounding_poly.get("normalizedVertices") or []
+
+
+def _box(vertices):
+    xs = [v.get("x", 0) for v in vertices] or [0]
+    ys = [v.get("y", 0) for v in vertices] or [0]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _split_on_gaps(words, group, hyphen):
+    """One Vision line -> one or more lines, split where the horizontal gap
+    between words is large. Vision regularly reports a whole table row
+    (every column) as ONE line; each cell has to be its own text line or
+    the row can't be laid out, and the gap is the only signal for that."""
+    heights = sorted(w["box"][3] - w["box"][1] for w in words)
+    h = heights[len(heights) // 2] or 1
+    segments, cur = [], [words[0]]
+    for w in words[1:]:
+        if w["box"][0] - cur[-1]["box"][2] > 1.2 * h:
+            segments.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+    segments.append(cur)
+    out = []
+    for i, seg in enumerate(segments):
+        text = "".join(w["text"] + w["sep"] for w in seg).strip()
+        last = i == len(segments) - 1
+        if hyphen and last and not text.endswith("-"):
+            text += "-"  # layout_units.para_text de-hyphenates across lines
+        out.append({
+            "text": text,
+            "words": [w["box"] for w in seg],
+            "word_texts": [w["text"] for w in seg],
+            # first word's top edge gives the writing direction
+            "vertices": seg[0]["vertices"],
+            "group": group,
+            "min_conf": min(w["conf"] for w in seg),
+        })
+    return out
 
 
 def _lines_from_annotation(annotation):
@@ -203,102 +243,175 @@ def _lines_from_annotation(annotation):
 
     Vision has no explicit "line" grouping -- only a break-type hint on
     each word's last symbol (SPACE/SURE_SPACE: more of this line follows;
-    EOL_SURE_SPACE/LINE_BREAK: this line ends here; HYPHEN: next word
-    continues with no space, a wrapped hyphenation). This walks each
-    paragraph's words in order, building up line text directly (append
-    the word, then conditionally append a separating space) rather than
-    joining a word list afterward, so a hyphenated pair genuinely gets no
-    space between them instead of needing to be un-joined after the fact.
+    EOL_SURE_SPACE/LINE_BREAK: this line ends here; HYPHEN: the line ends
+    in a hyphenated word-wrap). Each line carries its Vision paragraph as
+    `group` (lines from different paragraphs never merge into one layout
+    unit), its word boxes in the OCR'd image's pixel space (erasure), and
+    the lowest symbol confidence in it.
     """
     lines = []
-    for page in annotation.get("pages", []):
-        for block in page.get("blocks", []):
-            for paragraph in block.get("paragraphs", []):
+    for pi, page in enumerate(annotation.get("pages", [])):
+        for bi, block in enumerate(page.get("blocks", [])):
+            for qi, paragraph in enumerate(block.get("paragraphs", [])):
+                group = f"{pi}.{bi}.{qi}"
+                cur = []
                 words = paragraph.get("words", [])
-                line_text = ""
-                line_vertices = []
                 for i, word in enumerate(words):
-                    text, break_type = _word_text_and_break(word)
+                    text, break_type, conf, vertices = _word_info(word)
                     if not text:
                         continue
-                    line_text += text
-                    line_vertices.extend(_poly_vertices(word.get("boundingBox", {})))
-
-                    is_last_word = i == len(words) - 1
-                    if is_last_word or break_type in _LINE_END_BREAKS:
-                        lines.append((line_text, line_vertices))
-                        line_text = ""
-                        line_vertices = []
-                    elif break_type not in _NO_SPACE_BREAKS:
-                        line_text += " "
+                    cur.append({
+                        "text": text,
+                        "sep": " " if break_type in ("SPACE", "SURE_SPACE") else "",
+                        "conf": conf,
+                        "box": _box(vertices),
+                        "vertices": vertices,
+                    })
+                    if i == len(words) - 1 or break_type in _LINE_END_BREAKS or break_type == "HYPHEN":
+                        lines += _split_on_gaps(cur, group, break_type == "HYPHEN")
+                        cur = []
+                if cur:
+                    lines += _split_on_gaps(cur, group, False)
     return lines
 
 
-def _line_to_text_box(box_id, text, vertices, scale_x, scale_y, offset_x=0.0, offset_y=0.0):
-    """scale_x/scale_y: pixel-space -> page-point-space factors (1/_RENDER_SCALE,
-    uniform, for a whole-page or page-region render; an embedded image's
-    own bbox-width/native-pixel-width ratio, per axis, for a raw-image
-    OCR -- see ocr_image_regions, where an image's placement can scale
-    its two axes differently). offset_x/offset_y: page-space top-left of
-    the region OCR'd (0,0 for a whole page; an embedded image's own bbox
-    origin for a per-image OCR), added back in AFTER scaling, so the
-    resulting bbox is always in PAGE space regardless of source."""
-    xs = [v.get("x", 0) for v in vertices]
-    ys = [v.get("y", 0) for v in vertices]
-    x0 = min(xs) * scale_x + offset_x
-    y0 = min(ys) * scale_y + offset_y
-    x1 = max(xs) * scale_x + offset_x
-    y1 = max(ys) * scale_y + offset_y
-    height = max(y1 - y0, 1.0)
-    font_size = round(height * _HEIGHT_TO_FONT_SIZE_RATIO, 2)
-
-    # Angle of the top edge (first two vertices, Vision's documented
-    # clockwise-from-top-left ordering) -- same convention geometry.py's
-    # rotation_angle expects (top-down pixel space, negated dy). dx=0 is
-    # the CORRECT value for genuinely vertical (90-degree) text, not a
-    # degenerate case to guard against -- atan2 handles it natively, so
-    # this must NOT fall back to a truthy-only default like `dx or 1`
-    # (which would silently force dx=1 and corrupt exactly that case).
-    if len(vertices) >= 2 and (
-        vertices[1].get("x", 0) != vertices[0].get("x", 0)
-        or vertices[1].get("y", 0) != vertices[0].get("y", 0)
-    ):
-        dx = vertices[1].get("x", 0) - vertices[0].get("x", 0)
-        dy = vertices[1].get("y", 0) - vertices[0].get("y", 0)
-        line_dir = (dx, dy)
-    else:
-        line_dir = (1, 0)
-    rotation_angle = _rotation_angle(line_dir, _OCR_ROTATION_EPSILON_DEGREES)
-
-    return {
-        "id": box_id,
-        "text": text,
-        "bbox": [x0, y0, x1, y1],
-        "origin": [x0, y1],
-        "font": {"name": "", "size": font_size, "color": 0},
-        "line_dir": list(line_dir),
-        "is_rotated": rotation_angle != 0.0,
-        "rotation_angle": rotation_angle,
-        "source": "ocr",
-        "pipeline": {
-            "classification": None,
-            "target_lang": None,
-            "translated_text": None,
-            "needs_review": False,
-            "overflow": None,
-            "used_font_size": None,
-        },
-    }
+def _ink_rows(pixels, words, pixel_scale):
+    """(top, bottom) of the rows that actually contain ink inside a line's
+    word boxes, in the words' pixel space, or None if nothing is found.
+    Vision's word boxes are NOT a reliable height: same-size text in one
+    real table came back with 10px boxes on one row and 13-16px on
+    another, which made those rows' translations render 50% too large."""
+    H, W = pixels.shape[:2]
+    x0 = int(max(0, min(w[0] for w in words) * pixel_scale))
+    # No margin: Vision's boxes already enclose the ink, and in a tight
+    # table a margin reaches into the next row's letters.
+    y0 = int(max(0, min(w[1] for w in words) * pixel_scale))
+    x1 = int(min(W, max(w[2] for w in words) * pixel_scale))
+    y1 = int(min(H, max(w[3] for w in words) * pixel_scale))
+    region = pixels[y0:y1, x0:x1].astype(np.float32)
+    if region.shape[0] < 3 or region.shape[1] < 3:
+        return None
+    ring = np.concatenate([region[0], region[-1], region[:, 0], region[:, -1]])
+    ink = np.linalg.norm(region - np.median(ring, axis=0), axis=2) > 60
+    rows = np.nonzero(ink.mean(axis=1) > 0.01)[0]
+    if len(rows) < 2:
+        return None
+    return ((y0 + rows[0]) / pixel_scale, (y0 + rows[-1] + 1) / pixel_scale)
 
 
-def _text_boxes_from_annotation(annotation, id_prefix, scale_x, scale_y, offset_x=0.0, offset_y=0.0):
+def _line_color(pixels, words, scale_x, scale_y):
+    """Text colour of one OCR line, sampled from the OCR'd image: pixels
+    clearly away from the local background (median of the region's
+    border), taking the most distant 40%. `pixels` is an HxWx3 uint8
+    array in the same pixel space as `words` scaled by scale_x/scale_y."""
+    H, W = pixels.shape[:2]
+    x0 = int(max(0, min(w[0] for w in words) * scale_x - 2))
+    y0 = int(max(0, min(w[1] for w in words) * scale_y - 2))
+    x1 = int(min(W, max(w[2] for w in words) * scale_x + 2))
+    y1 = int(min(H, max(w[3] for w in words) * scale_y + 2))
+    region = pixels[y0:y1, x0:x1].astype(float)
+    if region.size == 0:
+        return 0
+    ring = np.concatenate([region[0], region[-1], region[:, 0], region[:, -1]])
+    bg = np.median(ring, axis=0)
+    dist = np.linalg.norm(region - bg, axis=2)
+    ink = region[dist > 30]
+    if len(ink) == 0:
+        return 0
+    d = np.linalg.norm(ink - bg, axis=1)
+    r, g, b = ink[d >= np.quantile(d, 0.6)].mean(axis=0)
+    return (int(r) << 16) | (int(g) << 8) | int(b)
+
+
+def _text_boxes_from_annotation(annotation, id_prefix, scale_x, scale_y, offset_x=0.0,
+                                offset_y=0.0, xref=None, pixels=None, pixel_scale=1.0):
+    """scale_x/scale_y: OCR'd-image pixel -> page point factors (per axis:
+    an embedded image's placement can stretch its axes differently).
+    offset_x/offset_y: page-space top-left of the OCR'd region. `pixels`
+    (optional, HxWx3 array of the OCR'd image at `pixel_scale` x its
+    OCR'd resolution) is used to sample each line's text colour.
+
+    Font size: OCR boxes hug the ink, which is SMALLER than the em size --
+    em ~= box height / 0.92 for a line with descenders (g, p, y, ...), /
+    0.72 without. Sizes within 0.7x-1.35x of the image's median are
+    snapped to that median so one table/list doesn't come out mixed.
+    The height is measured from the INK rows inside the line (_ink_rows)
+    when pixels are available, not from Vision's word boxes.
+    (The old `height * 0.75` rendered OCR text at roughly 55-70% of its
+    real size.)
+    """
+    lines = [l for l in _lines_from_annotation(annotation) if l["text"].strip()]
+    if not lines:
+        return []
+    ems, baselines = [], []
+    for l in lines:
+        desc = bool(_DESCENDER_RE.search(l["text"]))
+        top = min(w[1] for w in l["words"])
+        bottom = max(w[3] for w in l["words"])
+        ink = _ink_rows(pixels, l["words"], pixel_scale) if pixels is not None else None
+        if ink is not None:
+            top, bottom = ink
+        h = max((bottom - top) * scale_y, 0.5)
+        em = h / (0.92 if desc else 0.72)
+        ems.append(em)
+        page_bottom = bottom * scale_y + offset_y
+        # Ink bottom IS the baseline without descenders; with them, the
+        # baseline sits about 0.2 em higher.
+        baselines.append(page_bottom - 0.2 * em if desc else page_bottom)
+    em_med = sorted(ems)[len(ems) // 2]
+
     text_boxes = []
-    for line_no, (text, vertices) in enumerate(_lines_from_annotation(annotation)):
-        if not text.strip():
-            continue
-        text_boxes.append(
-            _line_to_text_box(f"{id_prefix}{line_no}", text, vertices, scale_x, scale_y, offset_x, offset_y)
-        )
+    for line_no, (l, em, baseline) in enumerate(zip(lines, ems, baselines)):
+        size = em_med if 0.7 * em_med <= em <= 1.35 * em_med else em
+        x0p, y0p, x1p, y1p = _box([{"x": v, "y": u} for w in l["words"] for v, u in ((w[0], w[1]), (w[2], w[3]))])
+        x0, y0 = x0p * scale_x + offset_x, y0p * scale_y + offset_y
+        x1, y1 = x1p * scale_x + offset_x, y1p * scale_y + offset_y
+
+        # Angle of the first word's top edge (Vision's clockwise-from-top-
+        # left vertex order) -- same convention geometry.rotation_angle
+        # expects. dx=0 is the CORRECT value for genuinely vertical text,
+        # not a degenerate case (do NOT use a truthy fallback like `dx or 1`).
+        v = l["vertices"]
+        if len(v) >= 2 and (v[1].get("x", 0) != v[0].get("x", 0) or v[1].get("y", 0) != v[0].get("y", 0)):
+            line_dir = (v[1].get("x", 0) - v[0].get("x", 0), v[1].get("y", 0) - v[0].get("y", 0))
+        else:
+            line_dir = (1, 0)
+        rotation_angle = _rotation_angle(line_dir, _OCR_ROTATION_EPSILON_DEGREES)
+        color = _line_color(pixels, l["words"], pixel_scale, pixel_scale) if pixels is not None else 0
+
+        text_boxes.append({
+            "id": f"{id_prefix}{line_no}",
+            "text": l["text"],
+            "bbox": [x0, y0, x1, y1],
+            "origin": [x0, baseline],
+            "font": {"name": "", "size": round(size, 2), "color": color, "flags": 0},
+            "line_dir": list(line_dir),
+            "is_rotated": rotation_angle != 0.0,
+            "rotation_angle": rotation_angle,
+            "source": "ocr",
+            "ocr": {
+                # Embedded image this text is baked into (None for a whole
+                # rendered page) + word boxes in that image's own pixels --
+                # reinsert.py erases exactly these by inpainting.
+                "xref": xref,
+                "words_px": [list(w) for w in l["words"]],
+                "words_pt": [
+                    [w[0] * scale_x + offset_x, w[1] * scale_y + offset_y,
+                     w[2] * scale_x + offset_x, w[3] * scale_y + offset_y]
+                    for w in l["words"]
+                ],
+                "group": l["group"],
+                "min_conf": round(l["min_conf"], 3),
+            },
+            "pipeline": {
+                "classification": None,
+                "target_lang": None,
+                "translated_text": None,
+                "needs_review": False,
+                "overflow": None,
+                "used_font_size": None,
+            },
+        })
     return text_boxes
 
 
@@ -316,14 +429,17 @@ def _ocr_region(fitz_page, clip_rect, id_prefix):
     that image, not just the image's own pixels -- see
     ocr_image_regions's docstring for the real bug this caused.
     """
-    pix = fitz_page.get_pixmap(matrix=pymupdf.Matrix(_RENDER_SCALE, _RENDER_SCALE), clip=clip_rect)
+    pix = fitz_page.get_pixmap(matrix=pymupdf.Matrix(_RENDER_SCALE, _RENDER_SCALE), clip=clip_rect, alpha=False)
     annotation = _call_vision(pix.tobytes("png"))
     if not annotation:
         return []
     offset_x = clip_rect.x0 if clip_rect is not None else 0.0
     offset_y = clip_rect.y0 if clip_rect is not None else 0.0
     scale = 1.0 / _RENDER_SCALE
-    return _text_boxes_from_annotation(annotation, id_prefix, scale, scale, offset_x, offset_y)
+    pixels = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)[..., :3]
+    return _text_boxes_from_annotation(
+        annotation, id_prefix, scale, scale, offset_x, offset_y, pixels=pixels
+    )
 
 
 def ocr_page(fitz_page, page_index):
@@ -340,7 +456,92 @@ def ocr_page(fitz_page, page_index):
     }
 
 
-def _ocr_raw_image(fitz_doc, xref, bbox_rect, id_prefix):
+def image_pixels(fitz_doc, xref):
+    """An embedded image as an HxWx3 uint8 RGB array (alpha dropped, any
+    colourspace converted) -- shared with reinsert.py's inpainting."""
+    pix = pymupdf.Pixmap(fitz_doc, xref)
+    if pix.alpha:
+        pix = pymupdf.Pixmap(pix, 0)
+    if pix.colorspace is None or pix.colorspace.n != 3:
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)[..., :3].copy()
+
+
+def _runs(mask, min_len):
+    """(row, start, end) of horizontal True-runs at least min_len long."""
+    padded = np.pad(mask, ((0, 0), (1, 1))).astype(np.int8)
+    d = np.diff(padded, axis=1)
+    rows_s, starts = np.nonzero(d == 1)
+    _, ends = np.nonzero(d == -1)
+    keep = ends - starts >= min_len
+    return zip(rows_s[keep], starts[keep], ends[keep])
+
+
+def raster_segments(pixels, word_boxes, min_frac=0.08):
+    """Long straight lines drawn INSIDE an image (table rules, frames,
+    dashed borders), as ([(x, y0, y1)], [(y, x0, x1)]) in image pixels.
+
+    Numpy stand-in for the reference script's cv2 morphology: pixels that
+    contrast with the image's dominant colour, dashes bridged across gaps
+    up to 3px, kept if the run is long (>= min_frac of the image, >= 25px)
+    and THIN (the pixels 4px either side are mostly background -- a
+    filled area also has long runs, but isn't a line). Runs through the
+    core of a word (underlines/strike-throughs of text) are dropped."""
+    gray = pixels.astype(np.float32).mean(axis=2)
+    dark = np.abs(gray - np.median(gray)) > 60
+    out = []
+    for vertical in (False, True):
+        m = dark.T if vertical else dark
+        closed = m.copy()
+        for k in (1, 2, 3):
+            closed[:, k:] |= m[:, :-k]
+        n_rows = m.shape[0]
+        min_len = max(25, int(m.shape[1] * min_frac))
+        segs, seen = [], set()
+        for r, a, b in _runs(closed, min_len):
+            above = m[max(r - 4, 0), a:b].mean()
+            below = m[min(r + 4, n_rows - 1), a:b].mean()
+            if above > 0.5 or below > 0.5:
+                continue
+            key = (int(r) // 3, int(a) // 10, int(b) // 10)
+            if key in seen:
+                continue
+            seen.add(key)
+            crosses = False
+            for x0, y0, x1, y1 in word_boxes:
+                if vertical:
+                    x0, y0, x1, y1 = y0, x0, y1, x1
+                h = y1 - y0
+                if y0 + 0.2 * h < r < y1 - 0.2 * h and a < x1 and b > x0:
+                    crosses = True
+                    break
+            if not crosses:
+                segs.append((float(r) + 0.5, float(a), float(b)))
+        out.append(segs)
+    hsegs, vsegs = out
+    return vsegs, hsegs
+
+
+def _ocr_xref(fitz_doc, xref, cache):
+    """(annotation, width, height, pixels) for an embedded image, calling
+    Vision at most ONCE per image per document: the same xref is often
+    placed on several pages (a repeated logo, a reused diagram)."""
+    if cache is not None and xref in cache:
+        return cache[xref]
+    image_dict = fitz_doc.extract_image(xref)
+    pixels = image_pixels(fitz_doc, xref)
+    if image_dict["ext"] in ("jpeg", "jpg", "png"):
+        data = image_dict["image"]
+    else:
+        # JPX / JBIG2 / etc. aren't Vision input formats.
+        data = pymupdf.Pixmap(pymupdf.csRGB, pixels.shape[1], pixels.shape[0], pixels.tobytes(), False).tobytes("png")
+    result = (_call_vision(data), pixels.shape[1], pixels.shape[0], pixels)
+    if cache is not None:
+        cache[xref] = result
+    return result
+
+
+def _ocr_raw_image(fitz_doc, xref, bbox_rect, id_prefix, cache=None):
     """OCRs an embedded image's OWN raw pixel data (extracted directly
     from the PDF via its xref), never a rendered page region -- see
     ocr_image_regions's docstring for why that distinction is load-
@@ -350,26 +551,44 @@ def _ocr_raw_image(fitz_doc, xref, bbox_rect, id_prefix):
     since an image's placement can stretch its two axes differently
     (confirmed non-uniform on a real seller PDF: PDF transform diagonal
     entries differed between axes for more than one embedded image)."""
-    image_dict = fitz_doc.extract_image(xref)
-    annotation = _call_vision(image_dict["image"])
+    annotation, width, height, pixels = _ocr_xref(fitz_doc, xref, cache)
     if not annotation:
-        return []
-    scale_x = bbox_rect.width / image_dict["width"]
-    scale_y = bbox_rect.height / image_dict["height"]
-    return _text_boxes_from_annotation(
-        annotation, id_prefix, scale_x, scale_y, bbox_rect.x0, bbox_rect.y0
+        return [], [], []
+    scale_x = bbox_rect.width / width
+    scale_y = bbox_rect.height / height
+    ox, oy = bbox_rect.x0, bbox_rect.y0
+    boxes = _text_boxes_from_annotation(
+        annotation, id_prefix, scale_x, scale_y, ox, oy, xref=xref, pixels=pixels,
     )
+    # Hard outer limit for the translated text's layout box (layout_units.py):
+    # text baked into an image stays inside that image.
+    for box in boxes:
+        box["image_bbox"] = list(bbox_rect)
+    if not boxes:
+        return [], [], []
+    seg_key = ("segments", xref)
+    if cache is not None and seg_key in cache:
+        vpx, hpx = cache[seg_key]
+    else:
+        vpx, hpx = raster_segments(pixels, [w for b in boxes for w in b["ocr"]["words_px"]])
+        if cache is not None:
+            cache[seg_key] = (vpx, hpx)
+    vsegs = [[x * scale_x + ox, y0 * scale_y + oy, y1 * scale_y + oy] for x, y0, y1 in vpx]
+    hsegs = [[y * scale_y + oy, x0 * scale_x + ox, x1 * scale_x + ox] for y, x0, x1 in hpx]
+    return boxes, vsegs, hsegs
 
 
-def ocr_image_regions(fitz_page, page_index, images):
+def ocr_image_regions(fitz_page, page_index, images, cache=None):
     """For each embedded image on an otherwise-normal page (one that DOES
     have real vector text elsewhere), OCRs just that image's OWN raw
-    pixel data and returns any text found as a flat list of text_boxes
-    in page-space coordinates -- meant to be ADDED to that page's
-    existing vector-extracted text_boxes, not replace them.
+    pixel data. Returns (text_boxes, vsegs, hsegs) in page space: the
+    text found -- meant to be ADDED to that page's existing
+    vector-extracted text_boxes, not replace them -- and the straight
+    lines drawn inside those images (raster_segments), which layout
+    treats as borders like drawn vector lines.
 
-    `images`: a list of (bbox, xref) pairs, e.g. from
-    `[(info["bbox"], info["xref"]) for info in page.get_image_info(xrefs=True)]`.
+    `images`: `page.get_image_info(xrefs=True)` dicts. `cache`: a dict
+    shared across a document's pages (see _ocr_xref).
 
     Deliberately OCRs the image's raw bytes (`_ocr_raw_image`), NOT a
     `get_pixmap(clip=...)` render of that region (`_ocr_region`, only
@@ -385,19 +604,27 @@ def ocr_image_regions(fitz_page, page_index, images):
     this by construction: there is no vector content in a raw image
     file, only whatever's actually baked into its own pixels.
 
-    Skips images below _MIN_IMAGE_OCR_AREA (not worth an API call); an
-    image with no text at all just costs one wasted call either way.
-    Also skips an image mostly overlapped by images already processed
-    (see _MAX_IMAGE_OVERLAP_RATIO) as a secondary safeguard against
-    genuinely duplicated raster content (e.g. a zoomed-detail crop of
-    another image) -- processes in the given order (PyMuPDF's own
-    page.get_image_info() order), so the FIRST image to claim a region
+    Skips images below _MIN_IMAGE_OCR_AREA (not worth an API call), and
+    rotated/mirrored placements (the bbox mapping assumes an upright
+    image). Also skips an image mostly overlapped by images already
+    processed (see _MAX_IMAGE_OVERLAP_RATIO) as a secondary safeguard
+    against genuinely duplicated raster content (e.g. a zoomed-detail
+    crop of another image) -- processes in PyMuPDF's
+    page.get_image_info() order, so the FIRST image to claim a region
     wins and later ones judged redundant against it are skipped.
     """
-    all_boxes = []
+    all_boxes, all_v, all_h = [], [], []
     claimed_rects = []
-    for image_no, (bbox, xref) in enumerate(images):
-        rect = pymupdf.Rect(bbox)
+    for image_no, info in enumerate(images):
+        xref = info.get("xref", 0)
+        if xref <= 0:
+            continue
+        m = pymupdf.Matrix(info["transform"])
+        if abs(m.b) > 1e-3 or abs(m.c) > 1e-3 or m.a <= 0 or m.d <= 0:
+            print(f"ocr_vision: image {xref} on page {page_index} is rotated/mirrored, OCR skipped",
+                  file=sys.stderr)
+            continue
+        rect = pymupdf.Rect(info["bbox"])
         area = rect.width * rect.height
         if area < _MIN_IMAGE_OCR_AREA:
             continue
@@ -405,7 +632,10 @@ def ocr_image_regions(fitz_page, page_index, images):
         if overlap_area / area >= _MAX_IMAGE_OVERLAP_RATIO:
             continue
         claimed_rects.append(rect)
-        all_boxes.extend(
-            _ocr_raw_image(fitz_page.parent, xref, rect, f"p{page_index}-ocr-img{image_no}-l")
+        boxes, vsegs, hsegs = _ocr_raw_image(
+            fitz_page.parent, xref, rect, f"p{page_index}-ocr-img{image_no}-l", cache
         )
-    return all_boxes
+        all_boxes += boxes
+        all_v += vsegs
+        all_h += hsegs
+    return all_boxes, all_v, all_h
