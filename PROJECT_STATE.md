@@ -1,8 +1,11 @@
 # Project State
 
-Last updated: 2026-09-21. Pipeline rebuilt per-unit (layout + OCR) on
-`feature/layout-rebuild`, see §6; the "OCR broken on localhost" report
-was a missing Vercel env var, now fixed (§7). Earlier (2026-09-20):
+Last updated: 2026-09-22. `feature/layout-rebuild` merged to `dev` (PR
+#12), then `dev` merged to `main` (PR #13) and deployed to Production —
+confirmed `READY` for commit `b13945d` via the Vercel API, and a live
+GET against the deployed site (`/` 200, `/api/extract` 501 as expected).
+See §6 for the full rebuild writeup; the "OCR broken on localhost"
+report was a missing Vercel env var, now fixed (§7). Earlier (2026-09-20):
 after the user tested the OCR fallback (`feature/ocr-fallback`, branched
 off `dev`) against a real 55-page seller PDF
 (`reference/sample_with_raft_img.pdf`) and found a real gap (pages with
@@ -891,11 +894,15 @@ translators that don't understand dimensioned technical drawings.
 
 ## 6. What's in progress
 
-**Layout rebuild DONE (2026-09-21), committed + pushed on
-`feature/layout-rebuild`** — cut from `feature/ocr-fallback` (not `dev`)
-because the OCR modules it rewrites exist only there: merge
-`feature/ocr-fallback` into `dev` first, or PR this branch on top of it.
-Rebuilt the pipeline around `working python script/pdf_translate.py`'s
+**Layout rebuild DONE and SHIPPED to Production (2026-09-22).**
+`feature/layout-rebuild` (cut from `feature/ocr-fallback`, since the OCR
+modules it rewrites existed only there) merged to `dev` via PR #12, then
+`dev` merged to `main` via PR #13 and deployed — confirmed `READY` for
+commit `b13945d` via the Vercel API, plus a live check against the
+deployed site (`/` 200, `/api/extract` 501 as expected for a GET). This
+also carries the earlier `feature/ocr-fallback` commits (whole-page +
+per-image OCR) to Production for the first time. Rebuilt the pipeline
+around `working python script/pdf_translate.py`'s
 approach (see §2 for each module), keeping our glossary / Neon cache /
 `gemini-3.1-flash-lite` batching, pure-numpy instead of opencv, plus
 `.python-version` = 3.14 and `numpy==2.5.3`.
