@@ -22,11 +22,8 @@ Known-bug fixes this module exists to encode (see CLAUDE.md):
     than the `rotate=` int (that param only accepts 0/90/180/270).
 """
 
-import base64
-import json
 import os
 import sys
-from http.server import BaseHTTPRequestHandler
 
 import pymupdf
 
@@ -242,47 +239,3 @@ def extract_document(pdf_stream_or_path, document_name=None):
         "page_count": len(pages),
         "pages": pages,
     }
-
-
-class handler(BaseHTTPRequestHandler):
-    """Vercel Python function entry point.
-
-    POST either raw PDF bytes (Content-Type: application/pdf) or JSON
-    {"pdf_base64": "...", "document": "name.pdf", "page_index": 0}.
-    Omit page_index to extract every page.
-    """
-
-    def do_POST(self):
-        content_type = self.headers.get("Content-Type", "")
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-
-        document_name = None
-        page_index = None
-
-        if content_type.startswith("application/json"):
-            payload = json.loads(body)
-            pdf_bytes = base64.b64decode(payload["pdf_base64"])
-            document_name = payload.get("document")
-            page_index = payload.get("page_index")
-        else:
-            pdf_bytes = body
-
-        if page_index is not None:
-            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                result = extract_page_full(doc, page_index)
-                result["document"] = document_name or "unknown.pdf"
-            finally:
-                doc.close()
-        else:
-            # extract_document already includes the same OCR fallback and
-            # manages its own doc open/close -- no need to duplicate that
-            # loop here.
-            result = extract_document(pdf_bytes, document_name)
-
-        response = json.dumps(result).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(response)

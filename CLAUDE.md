@@ -202,9 +202,13 @@ pixels**. This means:
   5. `feature/db-schema`
   6. `feature/drive-upload`
   7. `feature/editor-mvp`
-- Use Vercel's automatic PR preview deployments as part of review —
-  actually open the preview and look at a rendered translated PDF/editor
-  before merging, don't just review the diff.
+- **Preview deployments are OFF** (`vercel.json` `git.deploymentEnabled`:
+  `dev` and `feature/**` false) — only `main` builds, because every
+  build spends Hobby "Functions Storage" for 30 days (see the Python
+  dependencies section below). Review by actually running the change
+  locally with `npm run dev:full` and looking at a rendered translated
+  PDF before merging, not just the diff. After pushing a branch, confirm
+  no deployment was created (`vercel ls`); cancel one if it was.
 - Neon supports per-branch database branching tied to git branches —
   use it so a schema-changing feature branch doesn't corrupt `dev`'s
   data while testing in parallel.
@@ -484,6 +488,14 @@ pixels**. This means:
   5.x alike) crosses it; don't add it. Check `du -sh
   .vercel/cache/<fn>_py/.vercel/python/.venv/lib/python*/site-packages/*`
   after a build to see what a new package costs.
+- **Every `api/*.py` with a `class handler` is a separate ~90MB function**
+  (its own copy of PyMuPDF + numpy). Only `api/translate.py` has one;
+  every other `api/*.py` is a plain module it imports. Don't add a
+  handler to a helper module for debugging — call the functions directly
+  from a venv instead. Hobby "Functions Storage" (10GB) counts bundles
+  CREATED by builds over a rolling 30 days, and deleting deployments does
+  not lower it (observed 2026-09-22), so per-build size x number of
+  builds is what matters.
 - Before trusting a new Python dependency, confirm it with a real request
   against `npm run dev:full` — clear `.vercel/cache` and `api/__pycache__`
   first, or `vercel dev` will silently keep serving the previous build and

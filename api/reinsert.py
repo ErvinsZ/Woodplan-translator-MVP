@@ -42,12 +42,9 @@ A whole flattened page (no embedded image to edit) gets its words
 covered with the locally sampled background colour instead of white.
 """
 
-import base64
 import html
-import json
 import os
 import sys
-from http.server import BaseHTTPRequestHandler
 
 import numpy as np
 import pymupdf
@@ -422,35 +419,3 @@ def reinsert_and_export(pdf_bytes, document_json, page_indices=None):
         doc.close()
 
     return output_bytes, document_json
-
-
-class handler(BaseHTTPRequestHandler):
-    """Vercel Python function entry point.
-
-    POST JSON: {"pdf_base64": "...", "document": <classify_translate.py
-    output>, "page_index": optional int}. Returns JSON:
-    {"pdf_base64": <translated pdf>, "document": <document with each
-    unit's scale/overflow/needs_review filled in>}.
-    """
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        payload = json.loads(body)
-
-        pdf_bytes = base64.b64decode(payload["pdf_base64"])
-        document = payload["document"]
-        page_index = payload.get("page_index")
-        page_indices = {page_index} if page_index is not None else None
-
-        output_bytes, updated_document = reinsert_and_export(pdf_bytes, document, page_indices)
-
-        response = json.dumps({
-            "document": updated_document,
-            "pdf_base64": base64.b64encode(output_bytes).decode("ascii"),
-        }, ensure_ascii=False).encode("utf-8")
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(response)
