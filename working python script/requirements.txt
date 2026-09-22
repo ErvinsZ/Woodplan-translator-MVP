@@ -1,0 +1,8 @@
+pymupdf>=1.24.10
+opencv-python-headless
+numpy
+requests
+# optional: --translator free
+deep-translator
+# optional: --ocr tesseract (also needs the tesseract binary installed)
+pytesseract

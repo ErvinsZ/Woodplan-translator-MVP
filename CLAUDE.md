@@ -298,6 +298,13 @@ pixels**. This means:
 - `.env.local` is the SINGLE source of truth for secrets (gitignored). There is
   no `.env` file — it was deleted to avoid Prisma silently loading placeholder
   values from it.
+- **But `vercel dev`'s Python functions (`api/*.py`) do NOT read
+  `.env.local` — they get the Vercel project's Development env.** A key
+  present only in `.env.local` is silently missing there:
+  `GOOGLE_VISION_API_KEY` was, and every OCR call failed with "not set"
+  on localhost, caught per page so it just looked like "OCR does
+  nothing". Every key a Python function needs must also be added with
+  `vercel env add` (fixed 2026-09-21).
 - `prisma7.config.ts` (yes, that literal filename — not `prisma.config.ts`;
   Prisma's CLI auto-detects it without needing a `--config` flag, confirmed
   via `npx prisma validate`) explicitly loads `.env.local` via
@@ -307,8 +314,14 @@ pixels**. This means:
   7 section above for how pooled/direct are distinguished on this
   project's actual provider (Neon, hostname-based) — plus NextAuth +
   Google OAuth (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`NEXTAUTH_SECRET`/
-  `NEXTAUTH_URL`) + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY`. All must also be
-  set in Vercel's project environment variables for deploys — see the
+  `NEXTAUTH_URL`) + `ANTHROPIC_API_KEY` + `GEMINI_API_KEY` +
+  `GOOGLE_VISION_API_KEY` (Cloud Vision REST API, plain API key restricted
+  to that one API in Google Cloud Console — not a service-account/OAuth2
+  flow, see `api/ocr_vision.py`'s own docstring for why: that path needs a
+  crypto library to sign JWTs — originally avoided over compiled-extension
+  fears that turned out to be a local Python-version mismatch, see the
+  Python dependencies section below; a plain API key is still simpler). All must also
+  be set in Vercel's project environment variables for deploys — see the
   Vercel env var subsection below for two non-obvious ways to get that
   wrong.
 
@@ -442,32 +455,69 @@ pixels**. This means:
 ### Package manager
 - This project uses **npm**, not pnpm. Use npm commands throughout.
 
-### Python dependencies on Vercel (compiled extensions break at runtime)
-- NEVER add a Python package with a compiled/native extension to
-  `api/*.py`'s `requirements.txt` without testing it via a REAL
-  `vercel dev` request first — a clean install in a plain local venv
-  proves nothing about whether it'll actually run. `google-genai` (pulls
-  in `pydantic`/`pydantic-core`, a compiled Rust extension) and
-  `psycopg[binary]` (compiled `libpq`/`psycopg_c`) both installed and
-  imported fine in a local venv, then crashed EVERY request on real
-  `vercel dev` with `NO_RESPONSE_FROM_FUNCTION`
-  (`ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'`,
-  then `ImportError: no pq wrapper available`) — a platform mismatch
-  between the built wheel and Vercel's actual Python function runtime.
-  This is a known, recurring, *unresolved* issue for these specific
-  packages on Vercel (see Vercel's own community forum and pydantic's
-  GitHub issues), not specific to this repo, and it can also affect real
-  deployments, not just local `vercel dev` emulation.
-- Fixed by using pure-Python alternatives instead: raw REST via `urllib`
-  for the Gemini API (`api/gemini_translate.py`, same pattern as
-  `api/blob.py`'s hand-rolled Vercel Blob client — no official SDK
-  needed) and `pg8000` (pure Python, DB-API 2.0) for Postgres instead of
-  `psycopg` (`api/db.py`).
-- Before trusting a new Python dependency, check whether it ships a
-  compiled extension, and confirm it with a real request against
-  `npm run dev:full` — clear `.vercel/cache` and `api/__pycache__` first,
-  or `vercel dev` will silently keep serving the previous build and hide
-  the problem.
+### Python dependencies on Vercel (Python version pin + bundle size)
+- **Keep `.python-version` in the repo root, matching the host's
+  `python3`** (currently `3.14`). `@vercel/python` BUILDS dependencies
+  with the version pinned there (default 3.12 if unpinned), but
+  `vercel dev` RUNS the function with the host's plain `python3`
+  (`pythonPath: "python3"` in `@vercel/python/dist/index.js`). If those
+  differ, any package with per-Python-version compiled wheels crashes
+  every request with `NO_RESPONSE_FROM_FUNCTION` — e.g. numpy's
+  `_multiarray_umath.cpython-312-darwin.so` refusing to load under 3.14.
+  PyMuPDF never hit this only because its wheel is `abi3` (one build for
+  all versions).
+- **This, not a Vercel platform limitation, is what crashed `google-genai`
+  (`pydantic_core._pydantic_core`) and `psycopg[binary]` ("no pq
+  wrapper") earlier in this project** — the old rule "never add a
+  compiled extension" was a misdiagnosis. Confirmed 2026-09-21: with the
+  pin in place, numpy 2.5.3 ran under real `vercel dev` AND on a real
+  Vercel Preview deploy (Linux x86_64, Python 3.14.7). Compiled packages
+  are fine. The pure-Python choices already in place (`urllib` REST for
+  Gemini/Vision/Blob, `pg8000` for Postgres) still work and don't need
+  to be swapped back.
+- **Bundle size is the real hard limit.** `requirements.txt` is shared by
+  every `api/*.py` function, so one heavy package inflates all of them.
+  Past Vercel's standard size (~250MB unpacked), dependencies switch to
+  install-at-cold-start via a Linux `uv` binary — `vercel dev` on macOS
+  then fails EVERY Python function with `Exec format error`, including
+  `/api/translate`. `opencv-python-headless` alone (`cv2` ~125MB, 4.x and
+  5.x alike) crosses it; don't add it. Check `du -sh
+  .vercel/cache/<fn>_py/.vercel/python/.venv/lib/python*/site-packages/*`
+  after a build to see what a new package costs.
+- Before trusting a new Python dependency, confirm it with a real request
+  against `npm run dev:full` — clear `.vercel/cache` and `api/__pycache__`
+  first, or `vercel dev` will silently keep serving the previous build and
+  hide the problem. Local runs use macOS wheels, so for anything
+  platform-sensitive, also confirm on a throwaway Preview deploy
+  (`vercel deploy` from a temporary git worktree, then `vercel remove`).
+
+### Python multi-file imports on Vercel (sibling imports + circular imports)
+- **Every `api/*.py` file that imports a sibling module (`from foo import
+  bar`, where `foo` is another file in `api/`) needs this exact line near
+  the top, before that import:**
+  ```python
+  sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+  ```
+  Vercel loads each function's entrypoint via `importlib.exec_module`, not
+  by running it as a script, which does NOT add the script's own directory
+  to `sys.path` the way `python file.py` would. Without this line, a
+  sibling import that works fine in any local hand-rolled test harness
+  (because you control `sys.path` yourself there) fails with
+  `ModuleNotFoundError` on real `vercel dev`/production, silently. This
+  has already bitten this project more than once — remember it manually
+  for every new `api/*.py` file, there's no lint rule catching it.
+- **Two modules that need to import from EACH OTHER (A needs something
+  from B, B needs something from A) will circular-import** — fragile at
+  best, and this project's Vercel-specific `importlib`-based loading
+  makes it a real, not just theoretical, risk on top of that. Hit this
+  building `api/ocr_vision.py`: it needed `extract.py`'s rotation-angle
+  math, but `extract.py` also needed to import `ocr_vision.py` (to call
+  it as the flattened-page fallback from `extract_document`). Fixed by
+  pulling the shared piece (`rotation_angle`) out into its own
+  dependency-free module (`api/geometry.py`) that BOTH import, so neither
+  imports the other. When two sibling `api/*.py` modules seem to need
+  each other, that's the sign to extract the shared piece into a third,
+  lower-level module rather than importing across them directly.
 
 ---
 

@@ -87,6 +87,9 @@ GLOSSARY = {
     "pc": {
         "de": "Stk.",
     },
+    "pcs": {
+        "de": "Stk.",
+    },
     "P": {
         # Recurs identically on nearly every page in the same position;
         # a design glyph/icon rendered as literal text, not an English
