@@ -66,11 +66,15 @@ translators that don't understand dimensioned technical drawings.
                                               extract -> classify_translate -> reinsert
 ```
 
-**Pipeline (Python, Vercel serverless functions, one file = one function):**
+**Pipeline (Python on Vercel). `api/translate.py` is the ONLY Python
+function** — the other `api/*.py` files are plain modules it imports. Any
+`api/*.py` with a `class handler` becomes its own ~90MB function (its own
+copy of PyMuPDF + numpy) and multiplies Functions Storage per deployment;
+don't add one without a real caller (see §7). extract/classify_translate/
+reinsert had standalone debug handlers until 2026-09-22; removed.
 - `api/extract.py` — PyMuPDF text-span extraction from a PDF page. Exports
-  `extract_page(page, page_index)`, `extract_document(pdf_bytes_or_path, name)`,
-  plus an HTTP `handler` class (POST raw PDF or `{pdf_base64, page_index}` JSON,
-  returns extracted JSON). Defines the core JSON schema every later stage reads/
+  `extract_page(page, page_index)`, `extract_page_full(doc, page_index)`,
+  `extract_document(pdf_bytes_or_path, name)`. Defines the core JSON schema every later stage reads/
   writes (see `pipeline` sub-object below). Every text_box now also carries
   `"source": "vector"` or `"source": "ocr"` (see below). `extract_document`
   calls into `ocr_vision.py` for two distinct cases: the WHOLE page for a
@@ -1220,22 +1224,23 @@ The natural next slice, per CLAUDE.md's suggested branch order:
   (misses existing blobs; keeps listing deleted ones whose URLs already
   404) — the route loops list+delete until a pass finds nothing new.
   Merged to `dev` (PR #15) and `main` (PR #16), live on Production.
-- **Vercel "Functions Storage" (Hobby 10GB) is function bundles × every
-  retained deployment — not Blob, not PDFs.** Each deployment stores ~400MB
-  of functions: 4 Python functions (`translate`, `extract`,
-  `classify_translate`, `reinsert` — every `api/*.py` with a `handler`
-  class) at ~90MB each (PyMuPDF + numpy + deps, one copy per function),
-  plus ~36MB of Next.js routes. 38 retained deployments had reached
-  8.64GB. **Cleaned 2026-09-22:** deleted 35, kept 3 — current Production
-  (`dpl_DRYyHVEr…`, PR #16), previous Production for rollback
-  (`dpl_GsfuhxvzS…`, PR #14), and the latest `dev` Preview
-  (`dpl_9FENAkVi…`, backs the stable `git-dev` alias that Preview's
-  `NEXTAUTH_URL`/Google OAuth redirect point at). Every push still adds a
-  ~400MB deployment, so it will grow back. Two follow-ups, not done yet:
-  (1) only `/api/translate` is called by the frontend — dropping the
-  `handler` class from the other three would cut each deployment to
-  ~125MB; (2) set Project Settings -> Deployment Retention (dashboard) so
-  old previews expire automatically.
+- **Vercel "Functions Storage" (Hobby 10GB, "Last 30 days") counts
+  function bundles CREATED by deployments in a rolling 30-day window —
+  deleting deployments does NOT lower it.** Not documented publicly;
+  observed: 8.64GB, then 35 deployments deleted and 3 new ones built
+  (~400MB each) -> 9.73GB. So every build spends budget for 30 days.
+  What a build costs: before 2026-09-22 ~400MB (4 Python functions at
+  ~90MB each — PyMuPDF 55MB + numpy 22MB + deps, one copy per function —
+  plus ~36MB of Next.js routes); now ~125MB (`translate` is the only
+  Python function, see §2). **Only `main` builds** (`vercel.json`
+  `git.deploymentEnabled`: `dev` and `feature/**` false): each change
+  costs one Production build, not three. Test locally with `npm run
+  dev:full` instead of Preview URLs. The last `dev` Preview
+  (`dpl_9FENAkVi…`, the `git-dev` alias Preview's `NEXTAUTH_URL`/Google
+  OAuth point at) still exists but no longer updates. 35 old deployments
+  were deleted 2026-09-22 (kept current + previous Production and that
+  Preview) — tidy, but it freed none of this meter. What happens when a
+  Hobby team exceeds 10GB isn't documented either; don't find out.
 - **No rate limiting / abuse protection** on `/api/translate` — it's an
   unauthenticated endpoint that runs a real PDF pipeline, calls the Gemini
   API, and writes to Blob storage on every call. Gemini rate limiting

@@ -28,11 +28,9 @@ spans inside a unit (translation is paragraph-level now) and equals the
 original text for spans that are never touched.
 """
 
-import json
 import os
 import re
 import sys
-from http.server import BaseHTTPRequestHandler
 
 # Vercel's Python runtime loads the entrypoint via importlib (exec_module),
 # not as a directly-run script, so this file's own directory is never
@@ -319,23 +317,3 @@ def classify_translate_document(document, target_lang):
                     needs_review=unit["pipeline"]["needs_review"],
                 )
     return document
-
-
-class handler(BaseHTTPRequestHandler):
-    """Vercel Python function entry point.
-
-    POST JSON: {"target_lang": "de", "document": <extract.py output>}.
-    Returns the same shape with every unit's `pipeline` filled in.
-    """
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        payload = json.loads(body)
-        result = classify_translate_document(payload["document"], payload["target_lang"])
-
-        response = json.dumps(result, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(response)
