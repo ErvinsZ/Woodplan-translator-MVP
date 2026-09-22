@@ -47,6 +47,11 @@ next-env.d.ts
 /app/generated/prisma
 .env.local
 
+# Google Cloud service account keys -- never commit these regardless of
+# filename, they're a long-lived credential, not a rotatable session token
+*service-account*.json
+woodplan-translator-*.json
+
 # local scratch test fixtures (real pipeline output used for debugging,
 # not permanent reference fixtures -- kept local, not committed)
 /reference/sample_plan_2.pdf
@@ -54,3 +59,4 @@ next-env.d.ts
 /reference/sample_plan_broken_de.pdf
 /reference/sample_plan_broken_es.pdf
 /reference/font_bugs.pdf
+/reference/sample_with_raft_img.pdf

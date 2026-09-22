@@ -1,12 +1,32 @@
 # Project State
 
-Last updated: 2026-09-20, after Google Drive autosave (PR #8, merged to
-`dev`) was confirmed working end-to-end by the user (sign in, toggle on,
+Last updated: 2026-09-21. Pipeline rebuilt per-unit (layout + OCR) on
+`feature/layout-rebuild`, see §6; the "OCR broken on localhost" report
+was a missing Vercel env var, now fixed (§7). Earlier (2026-09-20):
+after the user tested the OCR fallback (`feature/ocr-fallback`, branched
+off `dev`) against a real 55-page seller PDF
+(`reference/sample_with_raft_img.pdf`) and found a real gap (pages with
+real vector text AND a separately-baked-in-text embedded image, e.g. a
+full materials table as one image, were silently completely untouched),
+added per-image OCR (`ocr_image_regions`), which then surfaced its own
+real bug on the same real PDF (rendering an image's page-region for OCR
+also rendered real vector text positioned near it, causing doubled/
+ghosted text), fixed by OCR-ing each embedded image's raw pixel data
+directly instead. Both fixes were confirmed working via DIRECT PYTHON
+PIPELINE CALLS in a venv (not through the actual running web app) —
+committed (`c4ae952`) on that basis, but the user then reported OCR
+still doesn't work when actually tested through localhost, which the
+commit-time verification apparently did not catch. Before that:
+verifying the OCR fallback against the real Vision API for the first
+time (two more real bugs found and fixed: an 8x-too-tight rotation
+epsilon, under-tuned erasure padding). Before that: the font-size-consistency fix (PR
+#10, merged to `dev` and `main`); Google Drive autosave (PR #8, merged
+to `dev`) confirmed working end-to-end by the user (sign in, toggle on,
 translate, file landed in Drive), while the OAuth consent screen is
-still in Google's Testing status. User is now working through Google's
-publishing/verification flow (submitted the new `/privacy` page's URL)
-to open the feature up beyond the developer's own account — see §5/§6.
-Previous entries: `dev` merged to `main`, deployed to a real Production
+still in Google's Testing status and the user is working through
+Google's publishing/verification flow to open it up beyond the
+developer's own account.
+Before that: `dev` merged to `main`, deployed to a real Production
 environment, Vercel's SSO deployment protection (which was blocking
 Production entirely) resolved, Google sign-in confirmed working
 end-to-end on Production/`dev` Preview/`localhost:3000`.
@@ -48,22 +68,91 @@ translators that don't understand dimensioned technical drawings.
   `extract_page(page, page_index)`, `extract_document(pdf_bytes_or_path, name)`,
   plus an HTTP `handler` class (POST raw PDF or `{pdf_base64, page_index}` JSON,
   returns extracted JSON). Defines the core JSON schema every later stage reads/
-  writes (see `pipeline` sub-object below).
-- `api/classify_translate.py` — consumes extract.py's JSON, classifies each
-  text box (`code` / `glossary_match` / `mixed` / `llm_match` / `unmatched`)
-  and fills in `pipeline.translated_text` + `needs_review`. Tiers, in order:
-  (1) regex code/number match, (2) whole-span static-glossary match,
-  (3) per-token mixed-span match (codes + words sharing one span), (4) a
-  whole-document pass (`_apply_llm_fallback`, runs once per document, not
-  per-page — dedup needs cross-page visibility): every span still
-  `unmatched` after 1-3 is deduped by stripped+lowercased text, checked
-  against the Postgres dynamic cache (`api/translation_cache.py`), and
-  whatever still misses goes to Gemini (`api/gemini_translate.py`) with
-  full-sentence context (never per-word — that's what breaks homographs
-  like "board" the lumber vs. "board" a ship). New Gemini translations are
-  written back to the cache. Tiers 1-3 have no LLM call at all — glossary
-  lookup only, case-insensitive, whitespace-safe. Imports `api/glossary.py`,
-  `api/translation_cache.py`, `api/gemini_translate.py`.
+  writes (see `pipeline` sub-object below). Every text_box now also carries
+  `"source": "vector"` or `"source": "ocr"` (see below). `extract_document`
+  calls into `ocr_vision.py` for two distinct cases: the WHOLE page for a
+  page with zero real vector text boxes (a flattened/rasterized scan or
+  export-to-image plan, per CLAUDE.md's original architecture note), or
+  EACH embedded image individually for a page that does have real vector
+  text but also contains one or more raster images with their own
+  separately baked-in text (found on a real seller PDF -- a full
+  materials table baked entirely into one embedded image on an otherwise
+  normal page). Either way, an OCR failure (no API key, Vision error) is
+  caught per-page/per-image and just leaves that content untouched, same
+  as if the fallback didn't exist -- it only ever adds coverage.
+- `api/geometry.py` — `rotation_angle(line_dir)`, split out of extract.py
+  into its own dependency-free module specifically so `ocr_vision.py` can
+  use the exact same angle math without a circular import (`extract.py`
+  needs to import `ocr_vision.py` for the fallback above; `ocr_vision.py`
+  needed the same rotation calculation extract.py already had).
+- `api/ocr_vision.py` — Google Cloud Vision `DOCUMENT_TEXT_DETECTION`,
+  called by `extract_document` for TWO distinct cases: `ocr_page` for a
+  fully flattened page (renders the whole page via `page.get_pixmap`),
+  and `ocr_image_regions` for individual embedded raster images with
+  their own baked-in text on an otherwise-normal (has-real-vector-text)
+  page -- see below and its own module docstring for why these two use
+  genuinely different rendering strategies, not just different scope.
+  POSTs to Vision's REST API via a plain API key (`GOOGLE_VISION_API_KEY`)
+  + `urllib` -- deliberately NOT a service-account/OAuth2 flow, which
+  would need a crypto library to sign JWTs (PyJWT/cryptography or
+  google-auth's own dependency chain) -- `cryptography` ships a compiled
+  Rust extension, exactly the class of dependency that already crashed
+  real Vercel Python deployments once this project (`google-genai`,
+  `psycopg[binary]` -- see §4). Reconstructs one text_box per VISUAL LINE
+  from Vision's word/symbol hierarchy (Vision has no explicit line
+  grouping, only a break-type hint --
+  SPACE/EOL_SURE_SPACE/LINE_BREAK/HYPHEN -- on each word's last symbol),
+  converts coordinates back to PDF points, and estimates a font size from
+  word-box height (Vision gives no font size, there's no real original
+  font to match here anyway). Every emitted text_box carries
+  `"source": "ocr"`.
+  - `ocr_image_regions` OCRs each embedded image's OWN RAW PIXEL DATA,
+    extracted directly via its PDF xref (`_ocr_raw_image`) -- NOT a
+    `get_pixmap(clip=...)` render of that image's page-space region
+    (which is exactly what `ocr_page` does, correctly, for a genuinely
+    empty whole page). Root-caused the hard way on a real seller PDF:
+    rendering a region for OCR also renders any real vector text
+    positioned on top of or near that embedded image, so Vision
+    re-detected text ALREADY correctly captured by normal vector
+    extraction, and both got drawn independently at slightly different
+    positions -- visible as literal doubled/ghosted text in the real
+    output. OCR-ing the raw image bytes directly is immune to this by
+    construction. Also skips images below a minimum size (not worth an
+    API call) and images mostly overlapped by an already-processed
+    image on the same page (also found for real: a "zoomed detail"
+    callout image overlapping three of a page's other four images).
+  - **A real bug was caught by the module's own mocked-response tests,
+    not left in**: the rotation-angle calculation originally used
+    `dx or 1` as a defensive fallback for a degenerate zero-vector case
+    that doesn't actually exist (`atan2(0, 0)` returns `0.0` natively,
+    no guard needed) -- since `0` is falsy in Python, `dx or 1` silently
+    forced `dx` to `1` whenever the TRUE dx was legitimately `0`, which
+    is exactly the correct value for genuinely vertical (90-degree)
+    text. Caught immediately by a mocked-vertical-text test expecting
+    exactly `-90.0` and getting `-89.4` instead; fixed by only
+    substituting the `(1, 0)` fallback when both dx AND dy are zero
+    (a truly degenerate same-point box), not whenever dx alone is zero.
+- `api/layout_units.py` — groups text into translation UNITS (see its
+  docstring): spans -> lines -> clusters -> paragraphs -> units, with
+  table detection (table-like clusters become one unit per cell),
+  exact-duplicate line merge, styled lead-in codes, OCR lines grouped by
+  image + Vision paragraph. Also `extract_segments` (drawn straight
+  lines). Called by extract.py (`extract_page_full`), which stores
+  `page["units"]` and `page["segments"]`; reinsert.py reuses
+  `page_lines` for obstacles.
+- `api/masking.py` — numbers/dimensions/part codes -> ⟦N⟧ placeholders
+  before any LLM call, restored byte-for-byte; translations with altered
+  placeholders are rejected. `numbers_preserved` vets cache hits.
+- `api/classify_translate.py` — translates each unit PARAGRAPH (not
+  span) and fills `unit["pipeline"]` (`translated_paragraphs`,
+  `classification`, `needs_review`). Tiers: code-only (unchanged) /
+  whole-paragraph glossary / every-line glossary joined (keeps the
+  span-built glossary useful) / per-token glossary (codes via masking
+  regex) / whole-document cache + masked Gemini (deduped by masked text,
+  so "STEP 1."…"STEP 8." are one item). Glossary hits keep an ALL-CAPS
+  source's case. Translated OCR paragraphs with digits read at Vision
+  confidence < 0.9 are flagged `needs_review`. Text boxes keep
+  `pipeline.unit_id`.
 - `api/glossary.py` — pure data, checked into git. `GLOSSARY[english_text][lang_code]
   = translation`. 114 German entries, built by sweeping all 15 pages of the
   sample PDF; ~0 Spanish/French entries so far (see §4 — the dynamic cache
@@ -97,9 +186,21 @@ translators that don't understand dimensioned technical drawings.
   and never raises past a single chunk's failure — a failed chunk just
   leaves its spans `unmatched`/`needs_review=True`, same as if the
   glossary had never covered them.
-- `api/reinsert.py` — refit (font-shrink toward 75% floor), redact original
-  text, reinsert translated/unchanged text at exact baseline origin. Handles
-  arbitrary rotation angles via `morph=` matrix (not just axis-aligned).
+- `api/reinsert.py` — per-unit re-layout (see its docstring): only
+  changed units are touched (codes/numbers keep original glyphs);
+  glyph-only redaction (`fill=False`, inset rect, images/line-art NONE,
+  TEXT_REMOVE); layout box grows until a real obstacle (drawn/raster line
+  segments, other text, placed boxes, bounds, 72-dpi `PixelProbe` ink);
+  callout labels pinned on their right grow left; single-line table cells
+  never grow down; OCR units anchored on their measured baseline;
+  `insert_htmlbox` (scale_low 0.75, then 0 + needs_review). Rotation
+  0/90/180/270 only (others left untranslated + flagged). OCR text in an
+  embedded image is erased by inpainting (`api/image_erase.py`, numpy
+  diffusion fill) and `replace_image` (JPEG stays JPEG, alpha kept), once
+  per image per document; whole-page OCR words are covered with the
+  sampled background colour.
+- `api/image_erase.py` — numpy stand-in for `cv2.inpaint` (opencv is too
+  big for Vercel, see CLAUDE.md).
 - `api/translate.py` — the only endpoint the frontend calls. Orchestrates the
   three stages above in one invocation (no internal HTTP hop). Downloads
   source PDF from a Blob URL, runs the pipeline, uploads result to Blob,
@@ -226,12 +327,20 @@ translators that don't understand dimensioned technical drawings.
       "font": {"name": str, "size": float, "color": int},
       "line_dir": [dx,dy],          # from the LINE not the span
       "is_rotated": bool, "rotation_angle": float,  # continuous degrees, not just 0/90/-90
-      "pipeline": {                 # empty at extraction, filled in later
-        "classification": "code"|"glossary_match"|"mixed"|"llm_match"|"unmatched"|null,
-        "target_lang": str|null, "translated_text": str|null,
-        "needs_review": bool,
-        "overflow": bool|null, "used_font_size": float|null, "available_len": float|null
+      "source": "vector"|"ocr",
+      "ocr": {...},                 # OCR only: xref, words_px, words_pt, group, min_conf
+      "pipeline": {                 # span-level; translation lives on units now
+        "classification": ..., "target_lang": str|null,
+        "translated_text": str|null,  # = text for untouched spans, None inside a unit
+        "needs_review": bool, "unit_id": str|absent
       }
+    }],
+    "segments": {"v": [[x,y0,y1]], "h": [[y,x0,x1]]},   # drawn + in-image lines
+    "units": [{                     # layout_units.py
+      "id", "source", "lines": [...], "paragraphs": [{"line_indexes", "text", "lead"}],
+      "rect", "bounds", "size", "color", "bold", "italic", "family", "rotate", "line_height",
+      "pipeline": {"classification", "target_lang", "translated_paragraphs": [str],
+                   "needs_review", "scale", "overflow"}
     }]
   }]
 }
@@ -281,9 +390,11 @@ translators that don't understand dimensioned technical drawings.
   (project-level file — global npm config does NOT have this set, don't
   rely on it).
 - **Python deps**: `requirements.txt` at repo root, pinned exact versions
-  (`pymupdf==1.28.2`, `certifi==2026.7.22`, `pg8000==1.31.5`). Deliberately
-  NO compiled/native-extension packages — see §4's native-extension
-  decision for why. No venv checked in; Vercel's
+  (`pymupdf==1.28.2`, `certifi==2026.7.22`, `pg8000==1.31.5`). Compiled
+  packages are fine as long as `.python-version` matches the host
+  `python3` and the bundle stays under Vercel's standard size (so no
+  opencv) — see CLAUDE.md's Python dependencies section and §4's
+  (corrected) native-extension entry. No venv checked in; Vercel's
   `uv`-based builder provisions one per function at build time.
 - **Design system**: warm "drafting paper" palette (see globals.css tokens),
   Space Grotesk (display) + IBM Plex Mono (labels/mono), explicitly avoiding
@@ -409,6 +520,52 @@ translators that don't understand dimensioned technical drawings.
   works via a real `vercel dev` request** (clear `.vercel/cache` and
   `api/__pycache__` first, or a stale build keeps serving old code) —
   don't trust a clean local venv install alone.
+  - **Update 2026-09-21 — the root cause above was misdiagnosed; this
+    was a local Python-version mismatch, not a Vercel platform issue.**
+    Reproduced with numpy: `@vercel/python` BUILDS deps with its
+    default Python (3.12, since the repo has no `.python-version`) but
+    `vercel dev` RUNS the function with the host's plain `python3`
+    (Homebrew 3.14 here — `pythonPath: "python3"` in
+    `@vercel/python/dist/index.js`). Per-Python-version wheels (numpy,
+    pydantic-core, psycopg) then fail with exactly the errors above
+    (`_multiarray_umath.cpython-312-darwin.so` incompatible with
+    cpython-314); PyMuPDF never broke only because its wheel is `abi3`.
+    Adding `.python-version` = `3.14` made numpy import and run cleanly
+    under real `vercel dev` (probe returned 200), and **confirmed on a
+    real Vercel Preview deploy** (Linux x86_64, Python 3.14.7, numpy
+    2.5.3): numpy-only inpaint erased 100% of test ink, `replace_image`
+    + `insert_htmlbox` worked, existing `/api/extract` and the homepage
+    still loaded under 3.14. Deployed via `vercel deploy` from a
+    throwaway git worktree (no branch pushed), then removed. The
+    rebuild branch should commit `.python-version` = `3.14` (keeps
+    local build/run Python identical) plus `numpy==2.5.3`.
+  - **Separate hard limit: opencv is out.** `opencv-python-headless`
+    (4.x and 5.x alike, `cv2` ~125MB unpacked) pushes EVERY Python
+    function past Vercel's standard bundle size (249MB), which switches
+    it to runtime dependency install via a Linux `uv` binary — `vercel
+    dev` on macOS then fails with `Exec format error` for all of
+    `api/*.py`, including `/api/translate`, since `requirements.txt` is
+    shared. numpy alone (22MB) stays under the limit.
+- **Reference rebuild target: `working python script/pdf_translate.py`**
+  (user's standalone script, 2026-09-21, produces clean DE/ES/FR output
+  on the real sample PDFs). Compared against this pipeline; it avoids
+  our render bugs through four structural differences: (1) paragraph
+  units (spans→lines→clustered paragraphs, de-hyphenated) instead of
+  per-span translate/fit; (2) `insert_htmlbox` with `scale_low` (wrap
+  then uniform shrink, returns spare/scale) instead of `insert_text` +
+  the shrink/wrap/bleed tiers; (3) real obstacle detection (drawn line
+  segments, other text, placed boxes, a 72-dpi `PixelProbe` for diagram
+  ink) instead of bbox-width guesses; (4) glyph-only redaction
+  (`fill=False`, inset rect, images/line-art NONE) of translated lines
+  only, and OCR text erased by inpainting the embedded image +
+  `replace_image` instead of white rects. Its gaps: sends numbers
+  through Gemini (10/754 cached entries had changed digits/units),
+  `gemini-2.5-flash` + 40-item chunks + no glossary/Neon cache, opencv
+  dependency (see above — replace `cv2.inpaint` with a numpy diffusion
+  fill; probe erased 100% of test ink in 58ms), large output files.
+  Our OCR font size (`_HEIGHT_TO_FONT_SIZE_RATIO = 0.75`) also looks
+  ~30% too small vs the script's `h/0.72`–`h/0.92` estimate (from
+  reading the code, not measured).
 - **`package.json`'s `dev` script stays `next dev`, not `vercel dev`.**
   `vercel dev` internally shells out to `npm run dev` to start the framework
   dev server — pointing `dev` at `vercel dev` itself causes infinite-
@@ -645,10 +802,143 @@ translators that don't understand dimensioned technical drawings.
   diagram-adjacent pages (rendered to PNG and visually checked); 218
   real spans with a genuine same-line neighbor confirmed to get the
   exact prior tight behavior, unchanged.
-  - Not yet committed — sitting on `dev`'s working tree as of this
-    entry, user should review before it's committed/pushed.
+  - Committed, pushed, merged to `dev` and then `main` (PR #10) —
+    confirmed `READY`/`target: "production"` via the Vercel API.
+- Google Vision OCR fallback extraction built on `feature/ocr-fallback`
+  (branched off `dev`): flatness detection in `extract.py`, the new
+  `ocr_vision.py`/`geometry.py` modules, and the OCR-erasure branch in
+  `reinsert.py` -- see §2's architecture entries above for each piece's
+  own writeup.
+  - **Verified against the REAL Vision API, not just mocked responses**
+    -- the user provided `GOOGLE_VISION_API_KEY` (after first creating a
+    service-account key by mistake; talked through why that specific
+    credential type was avoided on purpose -- it needs JWT signing,
+    which needs a compiled crypto library, exactly the risk this whole
+    module was designed to route around). Ran the full
+    flatness-detection -> real Vision OCR call -> classify/translate
+    (real glossary + Gemini, real German output) -> reinsert -> render
+    pipeline against the real synthetic flattened Tools-checklist page,
+    end to end, more than once as bugs were found and fixed.
+  - **Two more real bugs found from the REAL Vision response that the
+    earlier mocked tests could not have caught, since they were built
+    from idealized geometry**:
+    1. Vision's real word bounding boxes carry several degrees of
+       detection jitter even for genuinely horizontal text (confirmed
+       directly: up to 6.34° on an entirely horizontal real page) --
+       the original 0.5° rotation epsilon (tuned for PyMuPDF's
+       mathematically-exact vector line directions) flagged roughly a
+       third of that page's real OCR lines as `is_rotated: True` purely
+       from noise, which matters because reinsert.py's rotated-text path
+       skips the entire overflow/shrink system. Fixed by giving
+       `geometry.rotation_angle` a configurable epsilon
+       (`_OCR_ROTATION_EPSILON_DEGREES = 8.0` in `ocr_vision.py`,
+       comfortably above the observed noise, still well below any real
+       diagram angle-callout seen in vector data so far) rather than
+       widening the shared default used by the precise vector path too.
+    2. The erasure padding (`_OCR_ERASE_PADDING`), tuned to 0.75pt
+       against a synthetic test using a real vector span's own already-
+       generous bbox, was too optimistic for Vision's real (tighter)
+       boxes -- found by zooming into the real rendered output at each
+       step: a sliver of "Tools:" was still visible above its reported
+       top edge at 0.75pt; a "p" descender (from "Tips" in "Safety
+       Tips :") was still visible below its reported bottom edge even
+       at 3.0pt. Settled on 5.0pt after re-verifying the exact same
+       regions clean at each step -- see `reinsert.py`'s own comment for
+       the full before/after.
+  - **A real gap found by the user testing a real seller PDF
+    (`reference/sample_with_raft_img.pdf`, 55 pages, gitignored like the
+    project's other secondary fixtures -- kept local, not committed)
+    that the synthetic test fixture structurally could not surface**:
+    pages with real
+    vector text AND a separate embedded image with its OWN baked-in
+    text (e.g. a full 20+ row materials/cost table, baked entirely into
+    one image) were silently completely untouched -- the whole-page
+    flatness fallback correctly never triggers for such a page (it does
+    have real text), and nothing else was checking individual embedded
+    images at all. Added `ocr_image_regions` to `ocr_vision.py`, wired
+    into `extract_document` for exactly this case (real text present +
+    at least one embedded image above a minimum size): OCRs each image
+    individually and ADDS any text found to that page's existing
+    vector-extracted text_boxes.
+    - **A second real bug found immediately by testing against that
+      same real PDF, not caught in dev**: the first implementation
+      OCR'd each image via a `get_pixmap(clip=image_bbox)` page-region
+      render, same mechanism as the whole-page case. That's wrong for
+      THIS case specifically: rendering a page region also renders any
+      REAL VECTOR TEXT positioned on top of or near that image, so
+      Vision re-detected text ALREADY correctly captured by normal
+      vector extraction -- both the real vector span and the spurious
+      OCR duplicate got drawn, independently, at slightly different
+      positions, producing literal doubled/ghosted text in the real
+      rendered output (e.g. two overlapping "4335 mm" labels). Confirmed
+      by cross-checking the real page's own vector text dump: every
+      single "duplicated" label was already a real vector span.
+      Rewrote `ocr_image_regions` to OCR each embedded image's OWN RAW
+      PIXEL DATA instead, extracted directly via its PDF xref
+      (`_ocr_raw_image`) -- immune to this by construction, since a raw
+      image file has no vector content at all. Re-verified against the
+      same real page: the raw images turned out to have ZERO baked-in
+      text at all (every visible label really was vector text, which is
+      why the page looked doubled rather than simply having extra
+      content) -- the fix produces a byte-for-byte-equivalent-looking
+      clean render now, confirmed visually. Also added overlap-based
+      deduplication (`_MAX_IMAGE_OVERLAP_RATIO`) as a secondary
+      safeguard for the different case of two embedded images
+      genuinely, substantially overlapping each other in page space
+      (also found on this same real PDF -- a "zoomed detail" callout
+      image overlapping three of the page's other four images).
+  - Not yet committed as of this latest real-PDF verification pass — see §6.
 
 ## 6. What's in progress
+
+**Layout rebuild DONE (2026-09-21), committed + pushed on
+`feature/layout-rebuild`** — cut from `feature/ocr-fallback` (not `dev`)
+because the OCR modules it rewrites exist only there: merge
+`feature/ocr-fallback` into `dev` first, or PR this branch on top of it.
+Rebuilt the pipeline around `working python script/pdf_translate.py`'s
+approach (see §2 for each module), keeping our glossary / Neon cache /
+`gemini-3.1-flash-lite` batching, pure-numpy instead of opencv, plus
+`.python-version` = 3.14 and `numpy==2.5.3`.
+- Step 1 (vector layout): units, masking, glyph-only redaction,
+  obstacle-aware `insert_htmlbox` layout. Beyond the script: styled
+  lead-in codes keep their weight, callout labels grow left, duplicate
+  lines merged, invisible text skipped, glossary codes like "D1-A."
+  handled without Gemini, ALL-CAPS kept on glossary hits.
+- Step 2 (OCR): Vision once per image per document; lines split on large
+  gaps (table columns) and grouped by Vision paragraph; font size and
+  baseline measured from the INK rows (Vision's word boxes vary 10px vs
+  13-16px for same-size text, which rendered rows 50% too large);
+  text colour sampled from pixels; OCR lines overlapping vector text /
+  conf < 0.6 / < 4pt dropped; rotated/mirrored image placements skipped;
+  straight lines inside images detected (numpy) and used as borders
+  (fixed a title spilling out of an in-image frame); erasure by numpy
+  inpainting + `replace_image` instead of white rects; single-line table
+  cells never grow down.
+- Verified, not just direct calls: sample_plan_2 (DE) vs the script's
+  output — equal or better on every page, 0 overflows; sample_plan (15
+  pages, DE + ES) — every previously reported layout bug gone, DE 196/212
+  units from the glossary; sample_with_raft_img pages 3/4/5/55 (ES, real
+  Vision) vs the script — materials table inpainted cleanly, uniform
+  size, rows aligned with the untouched numbers, and MORE correct than
+  the script ("1 set" stays original pixels; the script printed "Yo
+  instalo" from Vision's "I set" misread), output 1.2MB vs the script's
+  4.3MB for the same pages. Real `vercel dev` -> `/api/translate`
+  requests with Blob upload/download for both the vector sample and the
+  OCR pages: output pixel-identical to the direct runs.
+- Known remaining: very narrow cells/labels still shrink below 0.75
+  (flagged needs_review), e.g. "4 pc" between two leader dots, "Interior
+  Doors" in a narrow OCR table cell; Gemini occasionally puts a
+  placeholder in an odd position ("⟦0⟧ doors" -> "Puertas 3"); brand
+  text like "DIY Plans" gets translated (the script had a `--keep` list;
+  we have none yet); diagonal-angle OCR units are left untranslated.
+- Test-run cache rows written with an early masking bug were deleted
+  from `glossary_terms` (only rows created by those runs). The table
+  holds ~300 de / ~570 es / ~200 fr rows, not the "4 German rows" §7
+  mentions below.
+
+Also still open, unrelated to the above: **no genuinely
+scanner-originated (camera/scan artifacts) test PDF has been tried** --
+see §7 for the current status of what has and hasn't been covered.
 
 User is now working through Google's publishing/verification flow to
 move the OAuth consent screen out of Testing status (submitting the new
@@ -689,6 +979,100 @@ The natural next slice, per CLAUDE.md's suggested branch order:
 
 ## 7. Known issues / TODOs
 
+- **ROOT CAUSE FOUND (2026-09-21) for the localhost OCR report below:**
+  under `vercel dev`, the Python functions do NOT see
+  `GOOGLE_VISION_API_KEY` — a real `/api/translate` request logged
+  `RuntimeError('GOOGLE_VISION_API_KEY is not set')` for every page,
+  while Gemini/DB worked. The key exists only in `.env.local` (39 chars)
+  and has zero rows in the Vercel project env (`vercel env ls`);
+  `GEMINI_API_KEY`/`DATABASE_URL` work because they ARE in Vercel's
+  Development env. So `vercel dev` Python functions evidently get the
+  Vercel project's env, not `.env.local`. **Fixed 2026-09-21:** added
+  via `vercel env add GOOGLE_VISION_API_KEY <env> --sensitive`, one call
+  per environment (development/preview/production, same value, piped
+  from `.env.local`). Re-ran the real `vercel dev` -> `/api/translate`
+  request: zero "not set" errors, request time 32s -> 83s (Vision calls
+  now happening). The OCR failure is caught per-page, which is why it
+  looked like "OCR does nothing" rather than an error. Rule of thumb:
+  any new key a Python function needs must be in Vercel's env, not
+  just `.env.local`, even for local `vercel dev`.
+- ~~**OCR still does not work when actually tested through localhost**~~
+  — **resolved**, see the root-cause entry directly above (missing
+  Vercel env var) and §6 (OCR rebuilt and verified through real
+  `vercel dev`). Original notes kept below for context: After the
+  per-image-OCR + raw-image-extraction fix (commit `c4ae952`), the user
+  reported it's still broken when tested for real on `localhost:3000`,
+  despite that fix being verified via direct Python calls into
+  `extract`/`classify_translate`/`reinsert` in a venv (not through the
+  actual running app). Session ended here at the user's request (tired,
+  explicitly asked to stop and just log this) — genuinely not
+  diagnosed, not even reproduced through the real app yet. Concrete
+  things to check first, before assuming it's the same class of bug as
+  before:
+  - **What exactly fails, and how** — no error text, screenshot, or
+    description of the failure mode was captured this session. Ask, or
+    reproduce directly, before guessing.
+  - **Which dev command was running.** This project's own documented
+    gotcha (§8, CLAUDE.md): plain `npm run dev` does NOT serve
+    `api/*.py` at all — hitting any Python endpoint under it 404s with
+    Next.js's HTML page, not a Python error. `npm run dev:full` (`vercel
+    dev`) is required for `api/translate.py` to run at all locally. If
+    the user was running plain `npm run dev`, that alone would look
+    exactly like "OCR doesn't work" (translation of anything wouldn't
+    work, not just OCR specifically) — worth ruling out first, it's the
+    cheapest possible explanation.
+  - **Stale Python build cache.** Also already-documented (§8): `vercel
+    dev` can silently keep serving a previous build of an `api/*.py`
+    function after a source change, unless `.vercel/cache` and
+    `api/__pycache__` are cleared first. The OCR modules changed
+    materially this session (new files even) — a stale build silently
+    still running pre-fix code would look identical to "the fix didn't
+    work."
+  - **Whether `GOOGLE_VISION_API_KEY` is actually reaching the Python
+    function's environment under `vercel dev`**, not just present in
+    `.env.local` — `vercel dev` reads env vars differently than a
+    directly-invoked Python script in a venv does; the direct-call
+    verification this session bypassed that whole path entirely, so it
+    proves the pipeline LOGIC is right but proves nothing about whether
+    `vercel dev` itself is wiring the key through correctly.
+  - Only after ruling out the above: re-open the actual code path
+    (`api/translate.py` -> `extract.extract_document` ->
+    `ocr_vision.py`) for a real bug, with real error output from a real
+    `vercel dev` request in hand, the same way every other real bug this
+    session was root-caused -- not by re-running the same direct-call
+    verification that already passed once and evidently isn't the whole
+    story.
+- **Google Vision OCR fallback is not rate-limited or cost-tracked at
+  all — and the real cost exposure is now confirmed worse than
+  originally estimated.** Unlike everything else in this stack (Neon's
+  hard-capped free tier, Gemini's in-process rate limiting per
+  CLAUDE.md's own deliberate design), Cloud Vision's
+  `DOCUMENT_TEXT_DETECTION` has a real, fairly modest free tier
+  (historically ~1000 units/month, 1 request = 1 unit, then billed past
+  that). The original estimate assumed "1 call per flattened page," but
+  `reference/sample_with_raft_img.pdf` (real seller PDF, 55 pages)
+  showed a single page can have 4 embedded images, several large enough
+  to pass the size filter — meaning a single MIXED page (not even a
+  flattened one) can cost multiple Vision calls, and a real multi-page
+  image-heavy document could burn through the monthly free tier in a
+  single translation request. Still not addressed (out of scope for
+  what was asked) — a hard per-document call budget is worth doing
+  before this sees real, unsupervised traffic, more urgently than
+  originally scoped.
+- ~~`GOOGLE_VISION_API_KEY` only in `.env.local`~~ — **fixed**: now in
+  all three Vercel environments (see the root-cause entry above).
+- **No real SCANNED (camera/scanner-originated) test PDF exists yet** —
+  everything verified so far is either a synthetic flattened fixture (a
+  real page's real vector text re-rendered as one image) or a real
+  born-digital seller PDF with embedded images
+  (`sample_with_raft_img.pdf`, confirmed to have zero real scan
+  artifacts — its images are clean exports, not photographs of paper).
+  This has exercised the real Vision REST contract, real OCR-detection
+  geometry, and a real multi-image mixed-page layout — genuinely
+  thorough coverage now — but still never a real scanner's actual skew,
+  noise, or compression artifacts. Lower priority than it was before
+  this session's real-PDF testing, but still worth doing if a customer
+  ever uploads an actual scanned plan.
 - **Google Drive autosave now confirmed working end-to-end by the user**
   (see §5) while the OAuth consent screen is still in Google's Testing
   publishing status — Drive API enabled, `drive.file` added to the
@@ -807,14 +1191,12 @@ The natural next slice, per CLAUDE.md's suggested branch order:
   cheap, separate win worth doing regardless." Output PDF is currently ~9.6%
   *larger* than input (redaction/reinsertion adds content-stream overhead
   with no offsetting image optimization).
-- **Vercel Python multi-file import gotcha is not documented anywhere except
-  this file and inline code comments.** If a fresh session adds a new
-  `api/*.py` file that imports a sibling module, it WILL silently work in any
-  local hand-rolled test harness (because you control `sys.path` yourself)
-  and WILL silently fail on real `vercel dev`/production with
-  `ModuleNotFoundError` unless the `sys.path.insert(...)` line from §2 is
-  copied into the new file too. There is no lint rule or test catching this
-  — must be remembered manually.
+- ~~Vercel Python multi-file import gotcha is not documented anywhere
+  except this file and inline code comments~~ — **fixed**: now in
+  CLAUDE.md's own "Python multi-file imports on Vercel" section, along
+  with the circular-import lesson from building `api/ocr_vision.py`/
+  `api/geometry.py`. Still no lint rule catching either case — still has
+  to be remembered manually, just no longer undocumented.
 - **Blob storage has no cleanup/lifecycle policy** beyond `translate.py`
   deleting the source upload immediately after processing (best-effort, not
   guaranteed — a mid-request crash would orphan it). Translated outputs are

@@ -1,599 +1,421 @@
-"""Refit, redaction/reinsertion, and export — the final pipeline stages.
+"""Redaction, re-layout and export -- the final pipeline stage.
 
-Consumes classify_translate.py's output (every text box already has
-`pipeline.translated_text` set) plus the original PDF bytes, and produces
-a translated PDF: shrink font where the translation overflows its
-original footprint, wipe the original text with a redaction, draw the
-translated (or unchanged) text back at the exact original position, and
-re-save. Never touches the underlying diagram images.
+Consumes classify_translate.py's output (every unit's
+`pipeline.translated_paragraphs` filled in) plus the original PDF bytes.
+Works per translation UNIT (layout_units.py), not per span, following
+`working python script/pdf_translate.py`, which rendered the real sample
+PDFs without the layout bugs the old span-level renderer had:
 
-Known-bug fixes this module exists to encode (see CLAUDE.md):
-  - Reinsertion uses `page.insert_text(origin, ...)`, one call per span at
-    its exact baseline origin, for every span that fits its original
-    footprint — `insert_textbox` into the bbox silently draws nothing for
-    tight single-line boxes, so it's never used for the normal case. The
-    one exception is spans that still overflow even after the shrink
-    floor (see the last bullet below), where a bounded `insert_textbox`
-    is used deliberately, with its own return value checked every time to
-    detect and fall back out of that same silent-nothing failure mode.
-  - Rotation uses the per-span `rotation_angle` degrees captured by
-    extract.py, not a re-derived horizontal/vertical guess.
-  - `insert_text(rotate=...)` only accepts 0/90/180/270 (verified against
-    the installed PyMuPDF's own docstring) but real plans have true
-    diagonal callouts (e.g. angle-dimension labels). Every non-zero angle
-    here goes through `morph=(Point(origin), Matrix(1,1).prerotate(angle))`
-    instead of `rotate=`, which empirically round-trips to the exact same
-    `rotation_angle` extract.py reads back out (verified for 0, ±45, ±90,
-    and non-axis angles) — one code path handles every angle correctly,
-    including the axis-aligned cases the old `rotate=` int also covered.
-  - `refit_span`'s shrink loop only ever assigned `used_size` inside the
-    "found a size that fits" branch, so a translation that STILL didn't
-    fit at the shrink floor rendered at the full, un-shrunk original font
-    size — the worst-case rendering, and the opposite of CLAUDE.md's
-    "shrink to a floor before flagging" spec. Silent (no error, no test
-    caught it) until French/Spanish LLM-fallback translations — which run
-    longer than the hand-curated German glossary ever did — visibly ran a
-    heading off the page edge. Fixed via a `while/else`: if the loop never
-    breaks (never finds a fit), render at the floor size, not the original.
-  - `apply_redactions()`'s default `images=2` ("blank out overlapping
-    image parts") leaves a visible boundary artifact wherever a text
-    span's redaction rect merely overlaps a raster image's bounding box —
-    even when no diagram pixels are visibly "under" the caption text.
-    Root-caused by direct pixel comparison (isolated by toggling each
-    `apply_redactions` param independently against a real sample page):
-    the border only appeared with `images=2`, never with `images=0` or
-    `images=1`, and was present regardless of `cross_out`. This produced
-    exactly the reported bug — a rectangular border baked onto the page,
-    framing reinserted captions that sit near/over a diagram's raster
-    image. Fixed by passing `images=0`: redaction should never touch
-    image content at all here, consistent with this pipeline's existing
-    "never touch the underlying diagram image" rule — text spans are the
-    only thing this stage is ever supposed to rewrite. Also pass
-    `add_redact_annot(..., cross_out=False)`, since the default
-    `cross_out=True` appends a stroked rectangle-plus-diagonal-cross to
-    the annotation's own appearance stream (see PyMuPDF's
-    `Page.add_redact_annot` source) that `apply_redactions()` would
-    otherwise bake permanently onto the page before deleting the
-    annotation — not the cause of the reported bug on the page tested,
-    but a real extra stray-ink source removed for the same reason.
-  - Reinsertion hardcoded `fontname="helv"` (Helvetica) for every span,
-    ignoring the span's actual extracted font entirely. Real plan PDFs use
-    serif display fonts for headings (Georgia, BodoniBT) and non-Helvetica
-    sans faces for body text (Calibri, Verdana) — rendering everything in
-    Helvetica is visibly the wrong typeface family/weight next to
-    untouched original text. Fixed by mapping the extracted font name to
-    the closest PyMuPDF base-14 family+weight (`_base14_font`) instead of
-    a hardcoded constant. This is a coarse substitution, not real font-
-    matching (CLAUDE.md explicitly cuts embedding/matching the exact
-    original typeface from MVP scope) — it only picks among the 4 base-14
-    families PyMuPDF ships, but that alone fixes serif-vs-sans and
-    regular-vs-bold mismatches, which was the visible complaint.
-  - A translation that still overflowed even at the shrink floor was
-    rendered anyway via a single `insert_text` call with no clipping —
-    since `insert_text` just draws along one line with no bounds, an
-    overlong line runs straight past its own column border and paints
-    over whatever sits to the right (adjacent table cell text, or a
-    diagram). `needs_review` was already set for this case, but the
-    render itself still corrupted the layout before any human ever saw
-    the flag. Fixed with a three-tier fallback for genuinely-overflowing,
-    non-rotated spans, each tried in order:
-      1. `_deep_shrink_fit`: keep shrinking well past CLAUDE.md's normal
-         75-80% review-flagging floor (down to `_DEEP_SHRINK_FLOOR_RATIO`)
-         and see if the WHOLE translation now fits back on the span's
-         ORIGINAL single line. Scanning every page of the real sample PDF
-         for German found 11 real overflow cases (all short labels/
-         headings where German just runs longer, e.g. "Shut" ->
-         "Geschlossen" in a box sized for 4 characters) — this alone
-         resolves all 11 with no layout change beyond a smaller font,
-         which beats either remaining option below. `pipeline.overflow`/
-         `used_font_size` are left exactly as the normal floor computed
-         them; only the actual render uses the deeper size.
-      2. `insert_textbox` on a rect capped to the *original* bbox width
-         (so it can't spill sideways) but taller (so it can wrap downward
-         instead), for text too long to rescue with tier 1 alone — e.g. a
-         whole extra sentence's worth. Height is sized to the number of
-         lines the text actually needs (capped at
-         `_OVERFLOW_WRAP_LINES_CAP`) — an early version used a flat
-         multi-line-tall guess for every overflowing span, which then
-         routinely overlapped the NEXT original line's own span
-         immediately below (a wrapped source sentence is several
-         single-line spans stacked in the original layout, not one tall
-         span — extract.py emits one per original line), producing
-         garbled overlapping text instead of the column-bleed it was
-         meant to fix.
-      3. Falls back to the original single-unclipped-line render only if
-         neither of the above can place the text without clobbering a
-         neighbor — still `needs_review`-flagged, so it's visible rather
-         than silently dropped (`insert_textbox` draws NOTHING, not a
-         partial line, when text doesn't fully fit — same failure shape
-         as known bug #1).
-    Normal (fitting) spans are untouched by any of this and still use the
-    known-bug-1-safe `insert_text`-at-origin path.
-  - `_available_length` measured every span's "room to grow" as its own
-    ORIGINAL bbox width — exactly as wide as that specific ENGLISH word
-    happened to render, not a real layout boundary. For a vertical list
-    or a hand-wrapped multi-line heading, that's not a real constraint at
-    all: it's an artifact of how long the source-language word/line
-    happened to be. Root-caused against a real reported bug (a Tools
-    checklist where every item is genuinely the same 20pt in the
-    original, but the translated render looked "randomly" tiny/large/
-    mixed) by extracting real span data from both the original and the
-    broken output: "Jig Saw" (a short original, ~72pt of inherited bbox
-    slack) -> "Scie sauteuse" got crushed to 12.6pt, while "Safety
-    goggles and gloves" (a long original, ~227pt of slack) stayed full
-    20pt — purely because the English words differed in length, nothing
-    to do with the translations' actual lengths or real page layout.
-    Same mechanism one level up on a two-line title, where the original
-    author's arbitrary line-break point became two independent bbox
-    widths. Fixed by loosening the constraint (real page margin, capped
-    to `_LOOSE_WIDTH_MULTIPLIER` × the original width) for any span with
-    no real same-line neighbor (`_has_same_line_neighbor`) — genuinely
-    tight contexts (adjacent cells, captions sitting directly above their
-    own diagram part in a row of same parts, e.g. the D1-A/D1-B labels on
-    the real inventory-list fixture) keep the exact prior tight behavior,
-    verified unchanged (218 real spans checked directly). Re-ran the full
-    15-page pipeline for German plus both flagged pages for Spanish and
-    French against the real sample fixtures: the checklist renders fully
-    uniform at 20pt with zero shrink in every case tried, the two-line
-    title renders either fully uniform or with a real, proportionate
-    (not wild) size difference when the translation genuinely doesn't
-    fit evenly across both lines, and no dimension-critical or
-    diagram-adjacent content regressed. Known blind spot, same as the
-    diagonal-text approximation above: extract.py doesn't capture diagram
-    image bboxes, so "no text neighbor" can't fully rule out a raster
-    diagram occupying the loosened space — `_LOOSE_WIDTH_MULTIPLIER`
-    exists specifically to bound that risk rather than trusting an empty
-    neighbor check all the way to the page edge.
+  - Only units whose text actually changed are touched. Numbers, part
+    codes, and anything left untranslated keep their ORIGINAL glyphs --
+    never redacted, never redrawn, byte-identical to the source.
+  - Original text is removed glyph-only: a redaction with NO fill
+    (`fill=False`) on a rect inset from the line bbox, applied with
+    images/line-art untouched and TEXT_REMOVE. Nothing is painted, so no
+    white box can land on a diagram (the old `fill=(1,1,1)` bbox
+    redaction clipped diagram ink wherever a caption touched it), and
+    the inset keeps neighbouring lines' glyphs out of the rect.
+    `images=0` stays mandatory (known bug #6: the default images=2 bakes
+    a border onto the page wherever a redaction rect touches an image).
+  - Layout box per unit: start from the unit's original rect and grow
+    right/down until a REAL obstacle -- a drawn line segment (table
+    rule, dashed frame), any other text line on the page, a box already
+    placed, the page margin/image bounds, or actual ink found by
+    rendering the page (`PixelProbe`, which is how diagrams are seen at
+    all: extract.py has no diagram geometry, they're raster images).
+  - `insert_htmlbox(rect, html, scale_low=...)` wraps first and shrinks
+    the WHOLE unit uniformly only if it still doesn't fit, returning
+    (spare, scale) -- so a heading/list/paragraph always renders at one
+    consistent size, and a failed fit is detectable (spare < 0), unlike
+    `insert_textbox`'s silent draw-nothing (known bug #1). Below
+    MIN_SCALE it retries with no floor and flags `needs_review`.
+  - Rotation: 0/90/180/270 via insert_htmlbox's `rotate`; a translated
+    unit at any other angle is left in the original language and
+    flagged (every diagonal span seen so far is a numeric angle callout,
+    which never becomes a unit at all).
+
+OCR-sourced units (text baked into an image) have no glyphs to redact.
+Text in an embedded image is erased by inpainting that image's own
+pixels (image_erase.py) and swapping it in with `replace_image` --
+collected per image across the whole document, applied once per image.
+A whole flattened page (no embedded image to edit) gets its words
+covered with the locally sampled background colour instead of white.
 """
 
 import base64
+import html
 import json
-import math
+import os
+import sys
 from http.server import BaseHTTPRequestHandler
 
+import numpy as np
 import pymupdf
 
-# Below this, an angle is treated as exactly axis-aligned (0/±90) when
-# picking the bbox dimension to measure available space against.
-_ROTATION_EPSILON_DEGREES = 0.5
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# For a horizontal span with no real neighbor to its right (see
-# _has_same_line_neighbor), how much page margin to assume is available
-# before treating the page edge itself as the constraint. A generic
-# minimal print margin, not derived from any specific document.
-_LOOSE_PAGE_MARGIN = 24.0
-# Cap on how much further than its own original bbox width a neighborless
-# span is allowed to grow, even when the page margin alone would allow
-# more -- bounds the one real risk this heuristic can't see: whether a
-# diagram's raster image (extract.py doesn't capture image bboxes, see
-# PROJECT_STATE.md) actually occupies that "empty" space. 3x comfortably
-# covers every real translated/original length ratio found in this
-# project so far (e.g. "Shut" -> "Geschlossen" is ~2.75x, see
-# _DEEP_SHRINK_FLOOR_RATIO's comment) without unconditionally trusting
-# "no text neighbor" all the way to the page edge.
-_LOOSE_WIDTH_MULTIPLIER = 3.0
+from image_erase import erase_words
+from layout_units import page_lines
+from ocr_vision import image_pixels
 
-# CLAUDE.md: "Shrink font down to a floor (~75-80% of original) before
-# flagging for human review."
-_FONT_SHRINK_STEP = 0.3
-_FONT_SHRINK_FLOOR_RATIO = 0.75
+# Smallest uniform scale insert_htmlbox may use before a unit is flagged
+# (CLAUDE.md: shrink to ~75-80% before flagging for human review).
+MIN_SCALE = 0.75
+# How far a unit may grow downward, as a multiple of its own height.
+MAX_GROW = 1.0
 
-# Last-resort shrink tried on a genuinely-overflowing span BEFORE wrapping
-# or bleeding (see the deep-shrink step in `_insert_span`) -- deliberately
-# well below CLAUDE.md's 75-80% review-flagging floor, and doesn't change
-# pipeline.overflow/used_font_size (those stay exactly as the floor above
-# computed them, so needs_review semantics are unaffected). Scanning every
-# page of the real sample PDF for spans that still overflow at the normal
-# floor found 11 cases (all short glossary-translated labels/headings
-# where German simply runs longer than English, e.g. "Shut" ->
-# "Geschlossen" in a box sized for 4 characters) -- 9 of 11 fit cleanly
-# back onto their ORIGINAL single line at 50% of the original size, and
-# tuning the ratio down to 40% (floor 6pt) fit all 11, including the
-# worst case (a 33pt-wide box built for "Shut", asked to hold
-# "Geschlossen"). Kept on ALL overflowing spans, not just short labels,
-# since even a long heading fitting back onto its own original single
-# line beats either wrapping into whatever sits directly below (often a
-# diagram, not blank paper) or bleeding sideways across a column border.
-_DEEP_SHRINK_FLOOR_RATIO = 0.4
-_DEEP_SHRINK_MIN_SIZE = 6.0
-
-# A span still flagged `overflow` after shrinking to the floor gets wrapped
-# into a box (anchored at the original bbox's top-left, capped to the
-# original bbox WIDTH) instead of overrunning past its column on a single
-# unclipped line. Box height is sized to how many lines the text actually
-# needs (see the wrap-height calculation in `_insert_span`), plus this much
-# slack -- and never more than _OVERFLOW_WRAP_LINES_CAP lines even for
-# extreme cases, since a wrapped multi-line PARAGRAPH is several
-# independent spans stacked immediately below each other in the original
-# layout (extract.py emits one span per original line), and a tall guess
-# here would overlap the next span's own line instead of just this one's.
-_OVERFLOW_WRAP_LINE_SLACK = 1
-_OVERFLOW_WRAP_LINES_CAP = 4
-# Empirically the minimum height/fontsize ratio `insert_textbox` needs to
-# render even a single line at all -- verified across every base-14 family
-# this pipeline uses (helv/hebo/tibo/cour) and several sizes by checking
-# its own returned spare-space value (negative = silently drew nothing,
-# the exact known-bug-1 failure mode `insert_text`-at-origin was chosen to
-# avoid in the first place). 1.25x (a plausible-looking "line height")
-# reliably failed this check; 1.8x reliably passed it.
-_LINE_HEIGHT_RATIO = 1.8
-
-# PyMuPDF base-14 mnemonics: family + (regular, oblique, bold, bold-oblique).
-_HELVETICA = ("helv", "heit", "hebo", "hebi")
-_TIMES = ("tiro", "tiit", "tibo", "tibi")
-_COURIER = ("cour", "coit", "cobo", "cobi")
-
-# Real plan PDFs found so far use font names like "Georgia-Bold",
-# "BodoniBT-Bold", "Calibri", "ArialMT", "Verdana" -- substrings, not the
-# generic "serif"/"sans"/"mono" labels. This list is deliberately just the
-# families seen in real sample data, not an exhaustive font taxonomy.
-_SERIF_MARKERS = (
-    "times", "georgia", "garamond", "bodoni", "cambria", "constantia",
-    "palatino", "book", "minion", "caslon", "didot", "baskerville",
-    "century", "charter", "roman", "serif",
-)
-_MONO_MARKERS = ("courier", "consolas", "menlo", "monaco", "mono")
+# Extra margin around a whole-page OCR word's cover rect beyond Vision's
+# ink-tight word box -- tuned against real Vision output (0.75pt and 3pt
+# both left visible fragments of ascenders/descenders; 5pt cleared them).
+_OCR_ERASE_PADDING = 5.0
+# JPEG quality for an inpainted image that was a JPEG originally.
+_JPEG_QUALITY = 90
 
 
-def _base14_font(original_font_name):
-    """Maps an extracted font name to the closest PyMuPDF base-14 mnemonic.
-
-    Coarse substitution (family + bold), not real font-matching -- CLAUDE.md
-    explicitly cuts embedding/matching the exact original typeface from MVP
-    scope. Picking the right one of PyMuPDF's 4 built-in families is enough
-    to stop translated text from visibly rendering in the wrong type family
-    (serif heading rendered as Helvetica, etc.) next to untouched original
-    text using the real font.
-    """
-    name = (original_font_name or "").lower()
-    bold = "bold" in name
-    italic = "italic" in name or "oblique" in name
-
-    if any(marker in name for marker in _MONO_MARKERS):
-        family = _COURIER
-    elif any(marker in name for marker in _SERIF_MARKERS):
-        family = _TIMES
-    else:
-        family = _HELVETICA
-
-    index = (2 if bold else 0) + (1 if italic else 0)
-    return family[index]
+def _y_overlap(a, b, tol=1.0):
+    return a.y0 < b.y1 - tol and a.y1 > b.y0 + tol
 
 
-def _text_width(text, font_size, fontname):
-    return pymupdf.get_text_length(text, fontname=fontname, fontsize=font_size)
+def _x_overlap(ax0, ax1, bx0, bx1, tol=1.0):
+    return ax0 < bx1 - tol and ax1 > bx0 + tol
 
 
-def _deep_shrink_fit(translated, original_size, fontname, available_len):
-    """Last-resort single-line fit for a span already flagged `overflow`.
-
-    Continues the SAME shrink stepping refit_span's loop already did, past
-    its 75-80% review-flagging floor, down to _DEEP_SHRINK_FLOOR_RATIO /
-    _DEEP_SHRINK_MIN_SIZE. Returns the largest size that fits on one line,
-    or None if even the deep floor doesn't fit (genuinely too much text
-    for this box, e.g. a whole extra sentence's worth -- that's when
-    `_insert_span` falls through to wrapping/bleeding instead).
-    """
-    floor = max(original_size * _DEEP_SHRINK_FLOOR_RATIO, _DEEP_SHRINK_MIN_SIZE)
-    size = original_size * _FONT_SHRINK_FLOOR_RATIO
-    while size > floor:
-        size -= _FONT_SHRINK_STEP
-        if _text_width(translated, size, fontname) <= available_len:
-            return round(size, 2)
-    return None
+def _right_limit(rect, bounds, vsegs, obstacles, pad):
+    right = bounds.x1
+    for x, y0, y1 in vsegs:
+        if x >= rect.x1 - 0.5 and y0 < rect.y1 - 1 and y1 > rect.y0 + 1:
+            right = min(right, x - pad)
+    for o in obstacles:
+        if o.x0 >= rect.x1 - 1 and _y_overlap(o, rect):
+            right = min(right, o.x0 - pad)
+    return max(right, rect.x1)
 
 
-def _has_same_line_neighbor(text_box, all_boxes):
-    """True if another span on the page sits immediately to this one's
-    right on the same horizontal band (bboxes vertically overlap, and the
-    other span starts at or after this one's right edge).
-
-    This is the safety gate for _available_length's loosened fallback
-    below: a real neighbor here — an adjacent table cell, a caption next
-    to another caption — means the original bbox width WAS a genuine
-    layout constraint, so behavior for that span stays exactly as before.
-    No neighbor does NOT prove the space to the right is empty —
-    extract.py doesn't capture diagram image bboxes (see
-    PROJECT_STATE.md), so a raster diagram could occupy that space with
-    no text neighbor around to reveal it. That residual risk is exactly
-    why the loosened fallback also caps growth via
-    _LOOSE_WIDTH_MULTIPLIER instead of trusting "no text neighbor" alone
-    all the way to the page edge.
-    """
-    bbox = text_box["bbox"]
-    y0, y1, x1 = bbox[1], bbox[3], bbox[2]
-    for other in all_boxes:
-        if other is text_box:
-            continue
-        obbox = other["bbox"]
-        if obbox[3] <= y0 or obbox[1] >= y1:
-            continue  # no vertical overlap -- not on the same horizontal band
-        if obbox[0] >= x1 - 1.0:
-            return True
-    return False
+def _left_limit(rect, bounds, vsegs, obstacles, pad):
+    left = bounds.x0
+    for x, y0, y1 in vsegs:
+        if x <= rect.x0 + 0.5 and y0 < rect.y1 - 1 and y1 > rect.y0 + 1:
+            left = max(left, x + pad)
+    for o in obstacles:
+        if o.x1 <= rect.x0 + 1 and _y_overlap(o, rect):
+            left = max(left, o.x1 + pad)
+    return min(left, rect.x0)
 
 
-def _available_length(text_box, fontname, all_boxes=None, page_width=None):
-    """How much room the original span had along its writing direction.
+class PixelProbe:
+    """Low-res render of the page (1px = 1pt) used to see where the page
+    is really empty -- the only way this pipeline "sees" raster diagrams.
+    Only applied to text on a clean background; over photos/renders the
+    geometric limits alone are used (the original text overlapped the
+    picture there anyway)."""
 
-    Axis-aligned horizontal text (angle ~0): the tight bbox width is
-    often NOT a real constraint at all for this shape of content — it's
-    just how wide the ORIGINAL-language word or line happened to render,
-    which is arbitrary once translated. Root-caused against real data: a
-    vertical checklist where every item is genuinely the same original
-    font size, but each translated item independently shrank by however
-    much LONGER its own translation happened to be than that ONE item's
-    specific English word — "Jig Saw" (a short original, so almost no
-    slack in its inherited bbox) crushed down to 12.6pt from 20pt, while
-    "Safety goggles and gloves" (a long original, so lots of inherited
-    slack) stayed full-size, purely because the English words happened to
-    differ in length. Same mechanism on a hand-wrapped two-line title.
-    Neither has anything to do with real page layout.
+    def __init__(self, page, tol=40):
+        pix = page.get_pixmap(dpi=72, alpha=False)
+        self.a = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)[..., :3].astype(np.int16)
+        self.sx, self.sy = pix.w / page.rect.width, pix.h / page.rect.height
+        self.tol = tol
 
-    When `all_boxes`/`page_width` are given and the span has no same-line
-    neighbor (see `_has_same_line_neighbor`), this loosens the constraint
-    to real page margin or a bounded multiple of the tight width, instead
-    of the tight bbox itself. Genuinely tight contexts (adjacent cells,
-    a caption beside another caption or close to a diagram WITH a text
-    neighbor) are unaffected — the neighbor check keeps them on the exact
-    prior behavior. Vertical/diagonal spans are also unaffected; every
-    diagonal span found so far is a numeric angle-callout (classification
-    "code", never translated), so there's no real content to validate
-    loosening against there yet.
+    def _box(self, x0, y0, x1, y1):
+        H, W = self.a.shape[:2]
+        return (int(max(0, min(W, x0 * self.sx))), int(max(0, min(H, y0 * self.sy))),
+                int(max(0, min(W, x1 * self.sx))), int(max(0, min(H, y1 * self.sy))))
 
-    Axis-aligned vertical text (angle ~±90): bbox height, exactly as
-    pipeline_tested.py validated against real data — not loosened, same
-    reasoning as diagonal text above.
+    def background(self, R, size):
+        """Background colour around R, or None if the surroundings are busy."""
+        ph, pv = min(0.5 * size, 8.0), min(0.3 * size, 5.0)
+        X0, Y0, X1, Y1 = self._box(R.x0 - ph, R.y0 - pv, R.x1 + ph, R.y1 + pv)
+        x0, y0, x1, y1 = self._box(R.x0, R.y0, R.x1, R.y1)
+        reg = self.a[Y0:Y1, X0:X1]
+        if reg.size == 0:
+            return None
+        m = np.ones(reg.shape[:2], bool)
+        m[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0] = False
+        ring = reg[m]
+        if len(ring) < 20:
+            return None
+        bg = np.median(ring, axis=0)
+        clean = (np.abs(ring - bg).max(axis=1) <= self.tol).mean()
+        return bg if clean >= 0.85 else None
 
-    Diagonal text: the axis-aligned bbox doesn't decompose into a single
-    along-direction length without also knowing font ascent/descent, so
-    this falls back to the original text's own rendered width as an
-    "it fit before" reference — flagged here rather than silently assumed
-    correct, since it isn't exercised by real content yet either.
-    """
-    bbox = text_box["bbox"]
-    angle = text_box["rotation_angle"]
+    def ring_color(self, R, pad=3.0):
+        """Median colour (0-1 RGB) just outside R -- what to cover R with."""
+        X0, Y0, X1, Y1 = self._box(R.x0 - pad, R.y0 - pad, R.x1 + pad, R.y1 + pad)
+        reg = self.a[Y0:Y1, X0:X1]
+        if reg.size == 0:
+            return (1, 1, 1)
+        ring = np.concatenate([reg[0], reg[-1], reg[:, 0], reg[:, -1]])
+        return tuple(float(v) / 255 for v in np.median(ring, axis=0))
 
-    if abs(angle) < _ROTATION_EPSILON_DEGREES:
-        tight = bbox[2] - bbox[0]
-        if (
-            all_boxes is not None
-            and page_width is not None
-            and not _has_same_line_neighbor(text_box, all_boxes)
-        ):
-            margin_cap = max(page_width - _LOOSE_PAGE_MARGIN - bbox[0], tight)
-            multiplier_cap = tight * _LOOSE_WIDTH_MULTIPLIER
-            return max(tight, min(margin_cap, multiplier_cap))
-        return tight
-    if abs(abs(angle) - 90) < _ROTATION_EPSILON_DEGREES:
-        return bbox[3] - bbox[1]
-    return _text_width(text_box["text"], text_box["font"]["size"], fontname)
+    def _ink(self, reg, bg):
+        return np.abs(reg - bg).max(axis=2) > self.tol
 
+    def free_right(self, R, limit, bg):
+        x0, y0, x1, y1 = self._box(R.x1 + 1, R.y0 + 0.15 * R.height, limit, R.y1 - 0.15 * R.height)
+        if x1 <= x0 or y1 <= y0:
+            return limit
+        cols = self._ink(self.a[y0:y1, x0:x1], bg).mean(axis=0)
+        hit = np.nonzero(cols > 0.02)[0]
+        return limit if len(hit) == 0 else (x0 + hit[0]) / self.sx
 
-def refit_span(text_box, all_boxes=None, page_width=None):
-    """Fills in pipeline.overflow / used_font_size / available_len.
+    def free_left(self, R, limit, bg):
+        x0, y0, x1, y1 = self._box(limit, R.y0 + 0.15 * R.height, R.x0 - 1, R.y1 - 0.15 * R.height)
+        if x1 <= x0 or y1 <= y0:
+            return limit
+        cols = self._ink(self.a[y0:y1, x0:x1], bg).mean(axis=0)
+        hit = np.nonzero(cols > 0.02)[0]
+        return limit if len(hit) == 0 else (x0 + hit[-1] + 1) / self.sx
 
-    `all_boxes`/`page_width` (the page's other text boxes and its width)
-    are optional context passed through to `_available_length` so it can
-    loosen the constraint for a span with no same-line neighbor — see
-    that function's docstring. Omit them to get the old tight-bbox-only
-    behavior (e.g. for a standalone/unit-tested single span).
-
-    Escalates needs_review to True on overflow, but never clears a
-    needs_review already set by classify_translate.py (e.g. an unmatched
-    span is still worth a human look even if it happens to fit).
-    """
-    pipeline = text_box["pipeline"]
-    translated = pipeline["translated_text"]
-    font_size = text_box["font"]["size"]
-    # Measure against the SAME font family that will actually be rendered
-    # (see _base14_font) -- measuring against a hardcoded "helv" while
-    # rendering in a wider/narrower substituted family (e.g. Courier) would
-    # make this overflow check silently wrong for the real render.
-    fontname = _base14_font(text_box["font"]["name"])
-    available_len = _available_length(text_box, fontname, all_boxes, page_width)
-
-    used_size = font_size
-    fits = _text_width(translated, used_size, fontname) <= available_len
-    if not fits:
-        floor = font_size * _FONT_SHRINK_FLOOR_RATIO
-        shrink = font_size
-        while shrink > floor:
-            shrink -= _FONT_SHRINK_STEP
-            if _text_width(translated, shrink, fontname) <= available_len:
-                used_size = shrink
-                fits = True
-                break
-        else:
-            # Never fit even at the floor -- render at the floor size as
-            # the best available effort rather than leaving used_size at
-            # the full original size, which would overflow even more.
-            # Still flagged via needs_review below either way.
-            used_size = floor
-
-    pipeline["used_font_size"] = round(used_size, 2)
-    pipeline["overflow"] = not fits
-    pipeline["available_len"] = round(available_len, 2)
-    if not fits:
-        pipeline["needs_review"] = True
-
-    return text_box
+    def free_down(self, x0_, x1_, top, limit, bg):
+        x0, y0, x1, y1 = self._box(x0_, top + 1, x1_, limit)
+        if x1 <= x0 or y1 <= y0:
+            return limit
+        rows = self._ink(self.a[y0:y1, x0:x1], bg).mean(axis=1)
+        hit = np.nonzero(rows > 0.01)[0]
+        return limit if len(hit) == 0 else (y0 + hit[0]) / self.sy
 
 
-def _unpack_color(color_int):
-    r = ((color_int >> 16) & 255) / 255
-    g = ((color_int >> 8) & 255) / 255
-    b = (color_int & 255) / 255
-    return (r, g, b)
+def layout_rect(unit, obstacles, vsegs, hsegs, probe):
+    """(rect, align) the translated unit may occupy -- see module docstring."""
+    R = pymupdf.Rect(unit["rect"])
+    if unit["rotate"] != 0:
+        return R, "left"
+    size = unit["size"]
+    pad = max(1.0, 0.25 * size)
+    b = pymupdf.Rect(unit["bounds"])
+    right = _right_limit(R, b, vsegs, obstacles, pad)
+    left = _left_limit(R, b, vsegs, obstacles, pad)
+    bg = probe.background(R, size)
+    if bg is not None:
+        right = max(R.x1, min(right, probe.free_right(R, right + pad, bg) - pad))
+
+    align, x0, x1 = "left", R.x0, right
+    line_rects = [pymupdf.Rect(l["rect"]) for l in unit["lines"]]
+    lgap, rgap = R.x0 - left, right - R.x1
+    centers = [(r.x0 + r.x1) / 2 for r in line_rects]
+    lefts = [r.x0 for r in line_rects]
+    centred_lines = len(line_rects) == 1 or (max(centers) - min(centers) < 0.5 * size
+                                             and max(lefts) - min(lefts) > size)
+    if centred_lines and lgap > 2 * size and abs(lgap - rgap) < max(3.0, 0.05 * (right - left)):
+        cx = (R.x0 + R.x1) / 2
+        half = min(cx - left, right - cx)
+        align, x0, x1 = "center", cx - half, cx + half
+    elif len(line_rects) == 1 and rgap < 0.5 * size and lgap > 2 * size:
+        # A label pinned against something on its right -- typically a
+        # callout "STEP 6 ●──" ending at its leader dot. Growing right is
+        # impossible and growing down wraps it; grow LEFT instead, right-
+        # aligned, so it stays attached to its leader.
+        if bg is not None:
+            left = min(R.x0, max(left, probe.free_left(R, left - pad, bg) + pad))
+        if R.x0 - left > 2 * size:
+            align, x0, x1 = "right", left, right
+
+    line_height = max(unit["line_height"], 1.2)
+    max_bottom = min(b.y1, R.y1 + MAX_GROW * max(R.height, size * 1.3))
+    if len(line_rects) == 1 and any(
+        _y_overlap(o, R) and b.x0 <= (o.x0 + o.x1) / 2 <= b.x1 for o in obstacles
+    ):
+        # A single line with text beside it on the same row is a table
+        # cell / row label: wrapping down would run into the next row, so
+        # it may only shrink (found on a real OCR'd materials table:
+        # "Cost per Unit" -> "Coste por unidad" wrapped into row 1).
+        max_bottom = R.y1
+    hard = b.y1  # first real obstacle below (no padding)
+    for y, sx0, sx1 in hsegs:
+        if y >= R.y1 - 0.5 and _x_overlap(sx0, sx1, x0, x1):
+            hard = min(hard, y)
+    for o in obstacles:
+        if o.y0 >= R.y1 - 1 and _x_overlap(o.x0, o.x1, x0, x1):
+            hard = min(hard, o.y0)
+    if bg is not None:
+        hard = min(hard, probe.free_down(x0, x1, R.y1, hard, bg))
+    bottom = max(R.y1, min(max_bottom, hard - pad))
+    # A PDF line bbox is tighter than size * line-height: always allow room
+    # for the ORIGINAL number of lines at 100% size -- with the first
+    # baseline aligned to the original one (see `top`), the glyphs occupy
+    # the same place the original glyphs did.
+    need = R.y0 + len(line_rects) * size * line_height * 1.02 + 0.5
+    bottom = max(bottom, min(need, hard + 0.25 * size))
+    # CSS line-height puts half the extra leading above the first line;
+    # shift up by that so the first baseline lands where the original was.
+    top = R.y0 - (line_height - 1) / 2 * size
+    if unit["source"] == "ocr":
+        # An OCR box starts at the INK top (cap or x-height), not at a font
+        # ascender line like a vector bbox, so anchor on the real baseline
+        # instead: insert_htmlbox puts the first baseline at
+        # top + (0.9 + (line_height - 1) / 2) * size (measured).
+        top = unit["lines"][0]["baseline"] - (0.9 + (line_height - 1) / 2) * size
+        # Room for the original line count at full size from that top --
+        # the part below the last baseline is invisible leading, so it may
+        # overlap the next row's box without any glyph overlapping.
+        bottom = max(bottom, top + len(line_rects) * size * line_height * 1.02 + 0.5)
+    return pymupdf.Rect(x0, top, x1, bottom), align
 
 
-def _next_line_gap(text_box, all_boxes):
-    """Vertical gap (points) to the nearest span directly below this one in
-    the same column (horizontally overlapping bboxes), or None if there is
-    no such neighbor on the page.
-
-    Used to cap an overflow wrap box so growing it downward can never run
-    into that neighbor's own line -- estimating the needed height from font
-    metrics alone (an earlier version of this fix) still regularly landed
-    taller than the ORIGINAL single-spaced line-to-line gap, since a
-    wrapped source paragraph's lines sit close together relative to a
-    smaller shrunk-to-floor font's own line height.
-    """
-    bbox = text_box["bbox"]
-    x0, x1, y1 = bbox[0], bbox[2], bbox[3]
-    best = None
-    for other in all_boxes:
-        if other is text_box:
-            continue
-        obbox = other["bbox"]
-        if obbox[1] < y1:
-            continue  # not below this span
-        overlap = min(x1, obbox[2]) - max(x0, obbox[0])
-        if overlap <= 0:
-            continue
-        gap = obbox[1] - y1
-        if best is None or gap < best:
-            best = gap
-    return best
+def _css(unit, align):
+    c = unit["color"]
+    color = "#%02x%02x%02x" % ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+    return (
+        "* {margin:0; padding:0;} p {margin:0;} "
+        f"body {{font-family: {unit['family']}; font-size: {unit['size']:.2f}px;"
+        f" line-height: {unit['line_height']:.2f}; color: {color}; text-align: {align};"
+        f" font-weight: {'bold' if unit['bold'] else 'normal'};"
+        f" font-style: {'italic' if unit['italic'] else 'normal'};}}"
+    )
 
 
-def _insert_span(page, text_box, next_line_gap=None):
-    translated = text_box["pipeline"]["translated_text"]
-    if not translated.strip():
-        return
-
-    origin = text_box["origin"]
-    used_size = text_box["pipeline"]["used_font_size"]
-    angle = text_box["rotation_angle"]
-    color = _unpack_color(text_box["font"]["color"])
-    fontname = _base14_font(text_box["font"]["name"])
-
-    if abs(angle) >= _ROTATION_EPSILON_DEGREES:
-        # Rotated overflow isn't handled by the wrap-box path below (no
-        # real diagonal-translated content seen yet to validate it against
-        # -- see _available_length's docstring), so this keeps the
-        # existing single-line-at-origin behavior regardless of overflow.
-        point = pymupdf.Point(origin)
-        matrix = pymupdf.Matrix(1, 1).prerotate(angle)
-        page.insert_text(
-            origin, translated, fontsize=used_size, fontname=fontname, color=color,
-            morph=(point, matrix),
+def _paragraph_html(text, lead):
+    """<p> for one paragraph; a styled lead-in code (layout_units.py's
+    "lead", e.g. a bold "D1-A.") keeps its own weight/style if the
+    translation still starts with it."""
+    if lead and text.startswith(lead["text"]):
+        style = (
+            f"font-weight: {'bold' if lead['bold'] else 'normal'};"
+            f" font-style: {'italic' if lead['italic'] else 'normal'};"
         )
-        return
+        rest = text[len(lead["text"]):]
+        return f'<p><span style="{style}">{html.escape(lead["text"])}</span>{html.escape(rest)}</p>'
+    return f"<p>{html.escape(text)}</p>"
 
-    if text_box["pipeline"]["overflow"]:
-        # Didn't fit even at the shrink floor. Before wrapping/bleeding,
-        # try a deeper shrink that keeps it on the ORIGINAL single line --
-        # this alone resolves the large majority of real overflow cases
-        # (see _DEEP_SHRINK_FLOOR_RATIO's comment) with no layout change
-        # at all beyond a smaller font, which beats both remaining options.
-        deep_size = _deep_shrink_fit(
-            translated, text_box["font"]["size"], fontname, text_box["pipeline"]["available_len"]
-        )
-        if deep_size is not None:
-            page.insert_text(origin, translated, fontsize=deep_size, fontname=fontname, color=color)
-            return
-        # Still doesn't fit on one line even at the deep floor. Rendering
-        # it anyway on one unclipped line would run straight past this
-        # span's own column border and paint over whatever sits to the
-        # right (adjacent cell text, a diagram). Wrap it into a box
-        # instead: capped to the span's available width (can't spill past
-        # whatever _available_length already decided was safe -- the
-        # tight original bbox width for a span with a real same-line
-        # neighbor, or the loosened budget for one without, see
-        # _available_length) and sized to just the number of lines the
-        # text actually needs, capped at both _OVERFLOW_WRAP_LINES_CAP
-        # and (if known) the real vertical gap to the next span directly
-        # below in the same column -- a flat multi-line-tall guess here
-        # would just as easily run into the NEXT original line's own span
-        # immediately below, since a wrapped source paragraph is several
-        # stacked single-line spans, not one tall one, and their
-        # line-to-line gap is usually tighter than even 2 lines' worth of
-        # a shrunk-to-floor font (confirmed by testing against a real
-        # multi-span wrapped heading).
-        bbox = text_box["bbox"]
-        width = max(text_box["pipeline"]["available_len"], used_size)
-        line_height = used_size * _LINE_HEIGHT_RATIO
-        lines_needed = math.ceil(_text_width(translated, used_size, fontname) / max(width, 1))
-        lines = min(lines_needed + _OVERFLOW_WRAP_LINE_SLACK, _OVERFLOW_WRAP_LINES_CAP)
-        max_height = page.rect.height - bbox[1]
-        if next_line_gap is not None:
-            # Small margin so the wrap box's bottom edge doesn't touch the
-            # next line's own text.
-            max_height = min(max_height, next_line_gap - 1)
-        if max_height >= line_height:
-            height = min(line_height * lines, max_height)
-            rect = pymupdf.Rect(bbox[0], bbox[1], bbox[0] + width, bbox[1] + height)
-            spare = page.insert_textbox(
-                rect, translated, fontsize=used_size, fontname=fontname, color=color
+
+def _changed(unit):
+    translated = unit["pipeline"].get("translated_paragraphs")
+    if not translated:
+        return False
+    return any(t is not None and t != p["text"] for t, p in zip(translated, unit["paragraphs"]))
+
+
+def _redact_rect(line_rect, rotate):
+    r = pymupdf.Rect(line_rect)
+    if rotate in (90, 270):
+        inset = 0.2 * r.width
+        return pymupdf.Rect(r.x0 + inset, r.y0 + 0.3, r.x1 - inset, r.y1 - 0.3)
+    inset = 0.2 * r.height
+    return pymupdf.Rect(r.x0 + 0.3, r.y0 + inset, r.x1 - 0.3, r.y1 - inset)
+
+
+def reinsert_page(fitz_page, page_json, image_erasures=None):
+    """Redacts and re-lays-out every changed unit on one page, in place.
+
+    `image_erasures` (xref -> (page_index, [word boxes in image px])) is
+    filled with the OCR words to inpaint; reinsert_and_export applies it
+    once per image after all pages are done. Without it (standalone
+    single-page use) the page's images are inpainted immediately."""
+    apply_now = image_erasures is None
+    if apply_now:
+        image_erasures = {}
+    units = page_json.get("units", [])
+    to_render = []
+    for unit in units:
+        if not _changed(unit):
+            continue
+        if unit["rotate"] is None:
+            unit["pipeline"]["needs_review"] = True
+            print(f"reinsert: {unit['id']} at unsupported angle, left untranslated", file=sys.stderr)
+            continue
+        to_render.append(unit)
+    if not to_render:
+        return page_json
+
+    probe = PixelProbe(fitz_page)
+    all_lines = page_lines(page_json)
+    segments = page_json.get("segments", {"v": [], "h": []})
+    vsegs, hsegs = segments["v"], segments["h"]
+
+    redacted = False
+    for unit in to_render:
+        for line in unit["lines"]:
+            if line["source"] == "ocr":
+                continue
+            fitz_page.add_redact_annot(
+                _redact_rect(line["rect"], unit["rotate"]), fill=False, cross_out=False
             )
-            if spare >= 0:
-                return
-            # insert_textbox itself reports it couldn't fit even one line
-            # in the space we thought was safe -- fall through to the
-            # single-line path below rather than trust a box that (per
-            # known bug #1) would otherwise silently draw nothing.
-        # Not enough vertical room for even one wrapped line before the
-        # next span's own line starts (common for tightly-leaded original
-        # headings). Rendering nothing would hide that a translation
-        # exists at all; a single overlong line is still visible and
-        # already flagged needs_review, so it's the safer of two
-        # imperfect options here.
-        page.insert_text(origin, translated, fontsize=used_size, fontname=fontname, color=color)
-        return
-
-    page.insert_text(origin, translated, fontsize=used_size, fontname=fontname, color=color)
-
-
-def reinsert_page(fitz_page, page_json):
-    """Refits, redacts, and reinserts every text box on one page.
-
-    Mutates fitz_page in place; page_json's text_boxes must already carry
-    pipeline.translated_text (i.e. classify_translate.py has run).
-    """
-    text_boxes = page_json["text_boxes"]
-    page_width = page_json["width"]
-    for text_box in text_boxes:
-        refit_span(text_box, text_boxes, page_width)
-
-    # Redact every span, not just translated ones -- a code/number span
-    # still needs its original glyphs wiped before the identical text is
-    # redrawn at the (possibly refit) size, so the whole page uses one
-    # consistent rendering pass rather than mixing original and new text.
-    for text_box in page_json["text_boxes"]:
-        fitz_page.add_redact_annot(
-            pymupdf.Rect(text_box["bbox"]), fill=(1, 1, 1), cross_out=False
+            redacted = True
+    if redacted:
+        fitz_page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+            text=pymupdf.PDF_REDACT_TEXT_REMOVE,
         )
-    # images=0: never let redaction touch image content, even a raster
-    # diagram's bounding box merely overlapping a caption's text bbox (see
-    # this function's module-level bug-fix note for how apply_redactions's
-    # default images=2 "blank out overlapping image parts" was leaving a
-    # visible boundary artifact wherever that happened -- a border baked
-    # onto the page exactly at the diagram image's edge). Diagrams are
-    # never supposed to be touched by this pipeline at all.
-    fitz_page.apply_redactions(images=0)
+    for unit in to_render:
+        for line in unit["lines"]:
+            if line["source"] != "ocr":
+                continue
+            ocr = line["ocr"]
+            if ocr.get("xref"):
+                entry = image_erasures.setdefault(ocr["xref"], (page_json["page_index"], []))
+                entry[1].extend(ocr["words_px"])
+            else:
+                pad = _OCR_ERASE_PADDING
+                for word in ocr["words_pt"]:
+                    r = pymupdf.Rect(word) + (-pad, -pad, pad, pad)
+                    fitz_page.draw_rect(r, fill=probe.ring_color(r), color=None)
 
-    for text_box in text_boxes:
-        next_line_gap = (
-            _next_line_gap(text_box, text_boxes) if text_box["pipeline"]["overflow"] else None
+    placed = []
+    for unit in sorted(to_render, key=lambda u: (round(u["rect"][1]), u["rect"][0])):
+        own = {l["key"] for l in unit["lines"]}
+        obstacles = [pymupdf.Rect(l["rect"]) for l in all_lines if l["key"] not in own] + placed
+        rect, align = layout_rect(unit, obstacles, vsegs, hsegs, probe)
+        body = "".join(
+            _paragraph_html(t if t is not None else p["text"], p.get("lead"))
+            for t, p in zip(unit["pipeline"]["translated_paragraphs"], unit["paragraphs"])
         )
-        _insert_span(fitz_page, text_box, next_line_gap)
-
+        css = _css(unit, align)
+        rot = unit["rotate"]
+        spare, scale = fitz_page.insert_htmlbox(rect, body, css=css, scale_low=MIN_SCALE, rotate=rot)
+        overflow = spare < 0
+        if overflow:
+            spare, scale = fitz_page.insert_htmlbox(rect, body, css=css, scale_low=0, rotate=rot)
+            unit["pipeline"]["needs_review"] = True
+        unit["pipeline"]["scale"] = round(scale, 3)
+        unit["pipeline"]["overflow"] = overflow
+        if rot in (0, 180):
+            placed.append(pymupdf.Rect(rect.x0, rect.y0, rect.x1, rect.y1 - max(0.0, spare)))
+        else:
+            placed.append(rect)
+    if apply_now:
+        apply_image_erasures(fitz_page.parent, image_erasures)
     return page_json
 
 
+def apply_image_erasures(doc, image_erasures):
+    """Inpaints each image's OCR'd words and swaps the edited image in.
+    A JPEG stays a JPEG (keeps the file size in check); an image with a
+    soft mask keeps its alpha."""
+    for xref, (page_index, words) in image_erasures.items():
+        try:
+            original = pymupdf.Pixmap(doc, xref)
+            erased = erase_words(image_pixels(doc, xref), words)
+            h, w = erased.shape[:2]
+            pix = pymupdf.Pixmap(pymupdf.csRGB, w, h, erased.tobytes(), False)
+            page = doc[page_index]
+            if original.alpha:
+                alpha = np.frombuffer(original.samples, np.uint8).reshape(
+                    original.h, original.w, original.n)[..., -1]
+                pix = pymupdf.Pixmap(pix, 1)
+                pix.set_alpha(alpha.tobytes())
+                page.replace_image(xref, pixmap=pix)
+            elif doc.extract_image(xref)["ext"] in ("jpeg", "jpg"):
+                page.replace_image(xref, stream=pix.tobytes("jpeg", jpg_quality=_JPEG_QUALITY))
+            else:
+                page.replace_image(xref, pixmap=pix)
+        except Exception as exc:
+            print(f"reinsert: could not inpaint image {xref} ({exc!r})", file=sys.stderr)
+
+
 def reinsert_and_export(pdf_bytes, document_json, page_indices=None):
-    """Runs refit/redact/reinsert across pages, returns (pdf_bytes, document_json).
+    """Runs redaction/re-layout across pages, returns (pdf_bytes, document_json).
 
     page_indices restricts which pages get modified (e.g. for testing a
     single page); omit to process every page in document_json.
     """
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
+        image_erasures = {}
         for page_json in document_json["pages"]:
             if page_indices is not None and page_json["page_index"] not in page_indices:
                 continue
-            reinsert_page(doc[page_json["page_index"]], page_json)
+            reinsert_page(doc[page_json["page_index"]], page_json, image_erasures)
+        apply_image_erasures(doc, image_erasures)
 
         output_bytes = doc.tobytes(garbage=4, deflate=True)
     finally:
@@ -607,8 +429,8 @@ class handler(BaseHTTPRequestHandler):
 
     POST JSON: {"pdf_base64": "...", "document": <classify_translate.py
     output>, "page_index": optional int}. Returns JSON:
-    {"pdf_base64": <translated pdf>, "document": <document with overflow/
-    used_font_size/available_len/needs_review filled in>}.
+    {"pdf_base64": <translated pdf>, "document": <document with each
+    unit's scale/overflow/needs_review filled in>}.
     """
 
     def do_POST(self):
