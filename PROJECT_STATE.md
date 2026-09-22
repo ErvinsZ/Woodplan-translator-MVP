@@ -1219,6 +1219,23 @@ The natural next slice, per CLAUDE.md's suggested branch order:
   Found while testing: Blob `list()` is eventually consistent both ways
   (misses existing blobs; keeps listing deleted ones whose URLs already
   404) — the route loops list+delete until a pass finds nothing new.
+  Merged to `dev` (PR #15) and `main` (PR #16), live on Production.
+- **Vercel "Functions Storage" (Hobby 10GB) is function bundles × every
+  retained deployment — not Blob, not PDFs.** Each deployment stores ~400MB
+  of functions: 4 Python functions (`translate`, `extract`,
+  `classify_translate`, `reinsert` — every `api/*.py` with a `handler`
+  class) at ~90MB each (PyMuPDF + numpy + deps, one copy per function),
+  plus ~36MB of Next.js routes. 38 retained deployments had reached
+  8.64GB. **Cleaned 2026-09-22:** deleted 35, kept 3 — current Production
+  (`dpl_DRYyHVEr…`, PR #16), previous Production for rollback
+  (`dpl_GsfuhxvzS…`, PR #14), and the latest `dev` Preview
+  (`dpl_9FENAkVi…`, backs the stable `git-dev` alias that Preview's
+  `NEXTAUTH_URL`/Google OAuth redirect point at). Every push still adds a
+  ~400MB deployment, so it will grow back. Two follow-ups, not done yet:
+  (1) only `/api/translate` is called by the frontend — dropping the
+  `handler` class from the other three would cut each deployment to
+  ~125MB; (2) set Project Settings -> Deployment Retention (dashboard) so
+  old previews expire automatically.
 - **No rate limiting / abuse protection** on `/api/translate` — it's an
   unauthenticated endpoint that runs a real PDF pipeline, calls the Gemini
   API, and writes to Blob storage on every call. Gemini rate limiting
