@@ -1204,11 +1204,21 @@ The natural next slice, per CLAUDE.md's suggested branch order:
   with the circular-import lesson from building `api/ocr_vision.py`/
   `api/geometry.py`. Still no lint rule catching either case — still has
   to be remembered manually, just no longer undocumented.
-- **Blob storage has no cleanup/lifecycle policy** beyond `translate.py`
-  deleting the source upload immediately after processing (best-effort, not
-  guaranteed — a mid-request crash would orphan it). Translated outputs are
-  never deleted at all; they'll accumulate indefinitely. Fine for MVP/demo
-  volume, not fine at any real scale.
+- ~~Blob storage has no cleanup/lifecycle policy~~ — **fixed 2026-09-22**
+  (`feature/blob-cleanup`): `app/api/cron/blob-cleanup/route.ts`, run
+  daily at 03:00 UTC by Vercel Cron (`vercel.json`; Hobby allows at most
+  daily), deletes every blob older than 24h — translated outputs plus
+  source uploads orphaned by a crashed request. So an output stays
+  downloadable (and Drive-saveable) for 24-48h. Protected by
+  `CRON_SECRET` (random, in `.env.local` + all three Vercel envs; Vercel
+  Cron sends it as `Authorization: Bearer`); `?dryRun=1` lists without
+  deleting. Blob can't be dropped altogether: the Download link IS the
+  blob URL, Drive save fetches from it, and a function response can't
+  carry a 5-16MB PDF (4.5MB cap). **The Blob free tier is 1GB, not
+  10GB** (dashboard); it was at 478MB. First manual run freed ~560MB.
+  Found while testing: Blob `list()` is eventually consistent both ways
+  (misses existing blobs; keeps listing deleted ones whose URLs already
+  404) — the route loops list+delete until a pass finds nothing new.
 - **No rate limiting / abuse protection** on `/api/translate` — it's an
   unauthenticated endpoint that runs a real PDF pipeline, calls the Gemini
   API, and writes to Blob storage on every call. Gemini rate limiting
